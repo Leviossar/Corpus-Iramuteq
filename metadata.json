@@ -1,0 +1,6 @@
+{
+  "name": "CorpusLab",
+  "description": "Preparador Inteligente de Corpus para IRaMuTeQ com extração documental, normalização lexical, palavras compostas e validação estrutural.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
