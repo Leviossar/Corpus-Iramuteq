@@ -54,15 +54,27 @@ export function cleanInvisibleCharacters(text: string): string {
   );
 }
 
+// Common standard Portuguese derivational suffixes that indicate broken single-word syllables
+const COMMON_DERIVATIONAL_SUFFIXES = new Set([
+  'mento', 'mentos', 'ção', 'ções', 'cao', 'coes', 'dade', 'dades',
+  'tude', 'tudes', 'ismo', 'ismos', 'ista', 'istas', 'mente',
+  'ência', 'ências', 'encia', 'encias', 'ância', 'âncias', 'ancia', 'ancias',
+  'ável', 'áveis', 'avel', 'aveis', 'ível', 'íveis', 'ivel', 'iveis',
+  'ional', 'ionais', 'ador', 'adores', 'adora', 'adoras', 'ante', 'antes',
+  'ente', 'entes', 'eza', 'ezas', 'oso', 'osa', 'osos', 'osas',
+  'logia', 'logias', 'tório', 'tórios', 'torio', 'torios',
+]);
+
 /**
- * Repairs de-hyphenation across line breaks with 3-tier safety classification:
- * - Tier A/B: Preserves genuine lexical hyphens:
- *   "político-\neconômico" -> "político-econômico"
- *   "recomenda-\nse" -> "recomenda-se"
- *   "pós-\ngraduação" -> "pós-graduação"
- * - Reconstructs broken single words:
- *   "desenvolvi-\nmento" -> "desenvolvimento"
- * - Tier C: Ambiguous cases are recorded for researcher review
+ * Repairs de-hyphenation across line breaks with strict 3-tier safety classification:
+ * - Tier A (Safe Automatic):
+ *   * Preserves genuine lexical hyphens ("político-\neconômico" -> "político-econômico", "segunda-\nfeira" -> "segunda-feira")
+ *   * Preserves enclitic pronouns ("recomenda-\nse" -> "recomenda-se")
+ *   * Preserves orthographic prefixes ("pós-\ngraduação" -> "pós-graduação")
+ *   * Joins verified single words with suffixes or broken syllables ("desenvolvi-\nmento" -> "desenvolvimento")
+ * - Tier C (Ambiguous / Uncertain):
+ *   * Preserves content without modification until researcher approves ("avaliação-\ninstitucional" -> "avaliação-institucional")
+ *   * Flags for researcher review with accurate line number and context snippet
  */
 export function fixLineBreakHyphenation(text: string): {
   cleanedText: string;
@@ -71,45 +83,67 @@ export function fixLineBreakHyphenation(text: string): {
   if (!text) return { cleanedText: '', ambiguousItems: [] };
 
   const ambiguousItems: AmbiguousCorrectionItem[] = [];
-  let lineCounter = 1;
 
   const cleanedText = text.replace(
     /([\p{L}]+)[-\u00AD\u2011]\s*[\r\n]+\s*([\p{L}]+)/gu,
     (match, p1: string, p2: string, offset: number) => {
       const lower1 = p1.toLowerCase();
       const lower2 = p2.toLowerCase();
+      // Calculate accurate 1-indexed line number in the original text
+      const lineNumber = (text.slice(0, offset).match(/\n/g) || []).length + 1;
+      const context = text
+        .slice(Math.max(0, offset - 25), Math.min(text.length, offset + match.length + 25))
+        .replace(/\s+/g, ' ');
 
-      // Case 1: Enclitic pronoun (e.g. "recomenda-se", "observa-se")
+      // Tier A - Case 1: Enclitic pronoun (e.g. "recomenda-se", "observa-se", "tornou-se")
       if (ENCLITICS.has(lower2)) {
         return `${p1}-${p2}`;
       }
 
-      // Case 2: Prefixes that require hyphen (e.g. "pós-graduação", "pré-requisito")
+      // Tier A - Case 2: Prefixes that require hyphen (e.g. "pós-graduação", "pré-requisito", "ex-diretor")
       if (HYPHEN_PREFIXES.has(lower1)) {
         return `${p1}-${p2}`;
       }
 
-      // Case 3: Recognized compound adjectives & roots (e.g. "político-econômico", "sócio-econômico", "segunda-feira")
+      // Tier A - Case 3: Recognized compound adjectives & roots (e.g. "político-econômico", "sócio-econômico", "segunda-feira")
       if (COMPOUND_ROOTS.has(lower1) || COMPOUND_ROOTS.has(lower2) || lower2 === 'feira') {
         return `${p1}-${p2}`;
       }
 
-      // Case 4: Ambiguous compound check (both parts are independent Portuguese words with length >= 4)
-      if (p1.length >= 4 && p2.length >= 4 && !lower1.endsWith('ando') && !lower1.endsWith('endo')) {
-        // Flag for human review
-        const item: AmbiguousCorrectionItem = {
-          id: `amb_${offset}`,
-          original: `${p1}-${p2}`,
-          suggested: `${p1}${p2}`,
-          line: lineCounter,
-          context: match.replace(/\s+/g, ' '),
-          status: 'pending',
-        };
-        ambiguousItems.push(item);
+      // Tier A - Case 4: Definite derivational suffixes or short syllable fragments (e.g. "desenvolvi-mento" -> "desenvolvimento", "implemen-tação" -> "implementação")
+      const isSuffixOrFragment =
+        COMMON_DERIVATIONAL_SUFFIXES.has(lower2) ||
+        lower2.endsWith('ção') ||
+        lower2.endsWith('ções') ||
+        lower2.endsWith('cao') ||
+        lower2.endsWith('coes') ||
+        lower2.endsWith('mento') ||
+        lower2.endsWith('mentos') ||
+        lower2.endsWith('dade') ||
+        lower2.endsWith('dades') ||
+        lower2.endsWith('mente') ||
+        p1.length < 4 ||
+        p2.length < 4;
+
+      if (isSuffixOrFragment) {
+        return `${p1}${p2}`;
       }
 
-      // Standard translineation word repair (e.g. "desenvolvi-\nmento" -> "desenvolvimento")
-      return `${p1}${p2}`;
+      // Tier C - Case 5: Ambiguous compound check (both parts are independent Portuguese words with length >= 4)
+      // e.g. "avaliação-institucional", "projeto-piloto", "custo-benefício"
+      // Conservative rule: preserve content without alteration until researcher confirms
+      const item: AmbiguousCorrectionItem = {
+        id: `amb_${offset}_L${lineNumber}`,
+        original: `${p1}-${p2}`,
+        suggested: `${p1} ${p2}`,
+        line: lineNumber,
+        context,
+        status: 'pending',
+      };
+      ambiguousItems.push(item);
+
+      // Preserve hyphenated form safely until researcher reviews
+      return `${p1}-${p2}`;
     }
   );
 

@@ -16,16 +16,18 @@ import {
   extractTextFromPdf,
   extractTextFromDocx,
   extractTextFromTxt,
-  runOcrOnScannedFile,
+  runRealMultiPageOcr,
 } from '../utils/documentExtractor';
 import {
   detectAcademicSections,
   processFullDocumentCleaning,
 } from '../utils/textNormalizer';
+import { storeFileBlob, getFileBlob } from '../utils/db';
 
 interface ImportViewProps {
   documents: DocumentItem[];
   onAddDocuments: (newDocs: DocumentItem[]) => void;
+  onUpdateDocument?: (updatedDoc: DocumentItem) => void;
   onRemoveDocument: (id: string) => void;
   onClearAll: () => void;
   onSelectDocumentForEdit: (id: string) => void;
@@ -36,6 +38,7 @@ interface ImportViewProps {
 export const ImportView: React.FC<ImportViewProps> = ({
   documents,
   onAddDocuments,
+  onUpdateDocument,
   onRemoveDocument,
   onClearAll,
   onSelectDocumentForEdit,
@@ -48,6 +51,9 @@ export const ImportView: React.FC<ImportViewProps> = ({
   const [ocrLanguage, setOcrLanguage] = useState<'por' | 'eng'>('por');
   const [isOcrRunning, setIsOcrRunning] = useState(false);
   const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrStatusText, setOcrStatusText] = useState<string>('');
+  const [ocrMissingFile, setOcrMissingFile] = useState<File | null>(null);
+  const ocrAbortControllerRef = useRef<AbortController | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -151,6 +157,7 @@ export const ImportView: React.FC<ImportViewProps> = ({
           extractedAt: new Date().toISOString(),
         };
 
+        await storeFileBlob(item.id, file);
         newDocItems.push(item);
       } catch (err: any) {
         console.error('Erro ao extrair documento:', err);
@@ -165,37 +172,88 @@ export const ImportView: React.FC<ImportViewProps> = ({
     }
   };
 
+  const handleCancelOcr = () => {
+    if (ocrAbortControllerRef.current) {
+      ocrAbortControllerRef.current.abort();
+      ocrAbortControllerRef.current = null;
+    }
+    setIsOcrRunning(false);
+    setOcrStatusText('Operação de OCR cancelada pelo usuário.');
+  };
+
   const handleStartOcr = async () => {
     if (!ocrModalDoc) return;
     setIsOcrRunning(true);
-    setOcrProgress(10);
+    setOcrProgress(5);
+    setOcrStatusText('Recuperando arquivo do armazenamento local...');
+
+    const abortController = new AbortController();
+    ocrAbortControllerRef.current = abortController;
 
     try {
-      // Find original file if possible or generate synthetic OCR
-      // Simulate OCR with Tesseract
-      setOcrProgress(50);
-      const simulatedOcrText = `[Texto extraído via OCR Tesseract.js - Língua: ${ocrLanguage === 'por' ? 'Português' : 'Inglês'}]\n\n` +
-        ocrModalDoc.rawText +
-        `\n\nEste documento continha páginas digitalizadas. O reconhecimento óptico de caracteres local reconstruiu as sentenças para permitir a análise lexical no IRaMuTeQ.`;
+      let targetBlob: Blob | File | null = ocrMissingFile;
+      if (!targetBlob) {
+        targetBlob = await getFileBlob(ocrModalDoc.id);
+      }
 
-      const detected = detectAcademicSections(simulatedOcrText);
-      const cleaned = processFullDocumentCleaning(simulatedOcrText, ocrModalDoc.exclusionSettings, detected);
+      if (!targetBlob) {
+        setIsOcrRunning(false);
+        setOcrStatusText('Arquivo original não encontrado no cache. Selecione o arquivo PDF abaixo para prosseguir.');
+        return;
+      }
 
-      ocrModalDoc.rawText = simulatedOcrText;
-      ocrModalDoc.normalizedText = cleaned.normalizedText;
-      ocrModalDoc.sectionCleanedText = cleaned.sectionCleanedText;
-      ocrModalDoc.cleanedText = cleaned.sectionCleanedText;
-      ocrModalDoc.reviewedText = cleaned.sectionCleanedText;
-      ocrModalDoc.isScannedPdf = false;
-      ocrModalDoc.ocrApplied = true;
+      const ocrResult = await runRealMultiPageOcr(
+        targetBlob,
+        ocrLanguage,
+        (update) => {
+          setOcrProgress(update.percent);
+          setOcrStatusText(update.statusText);
+        },
+        abortController.signal
+      );
+
+      if (!ocrResult.text || ocrResult.text.trim().length === 0) {
+        throw new Error('Nenhum texto pôde ser reconhecido pelo motor OCR nas páginas processadas.');
+      }
+
+      setOcrStatusText('Normalizando texto extraído e identificando seções...');
+      const detected = detectAcademicSections(ocrResult.text);
+      const cleaned = processFullDocumentCleaning(ocrResult.text, ocrModalDoc.exclusionSettings, detected);
+
+      const updatedDoc: DocumentItem = {
+        ...ocrModalDoc,
+        rawText: ocrResult.text,
+        normalizedText: cleaned.normalizedText,
+        sectionCleanedText: cleaned.sectionCleanedText,
+        cleanedText: cleaned.sectionCleanedText,
+        reviewedText: cleaned.sectionCleanedText,
+        isScannedPdf: false,
+        ocrApplied: true,
+        ocrStats: ocrResult.stats,
+        ambiguousCorrections: cleaned.ambiguousItems,
+      };
+
+      if (onUpdateDocument) {
+        onUpdateDocument(updatedDoc);
+      }
 
       setOcrProgress(100);
+      setOcrStatusText(
+        `OCR concluído com sucesso! ${ocrResult.stats.ocrPages} página(s) processada(s) via Tesseract, ${ocrResult.stats.nativePages} preservada(s) nativamente.`
+      );
+
       setTimeout(() => {
         setIsOcrRunning(false);
         setOcrModalDoc(null);
-      }, 500);
-    } catch (err) {
-      console.error('Falha no OCR:', err);
+        setOcrMissingFile(null);
+      }, 1200);
+    } catch (err: any) {
+      if (err?.message?.includes('cancelada')) {
+        setOcrStatusText('Operação de OCR interrompida pelo pesquisador.');
+      } else {
+        console.error('Falha no OCR:', err);
+        setOcrStatusText(`Falha no OCR: ${err?.message || 'Erro durante processamento'}`);
+      }
       setIsOcrRunning(false);
     }
   };
@@ -442,16 +500,17 @@ export const ImportView: React.FC<ImportViewProps> = ({
             </div>
 
             <p className="text-xs text-slate-600 leading-relaxed">
-              O arquivo <strong>{ocrModalDoc.name}</strong> parece ser uma imagem ou PDF digitalizado. O CorpusLab executará o motor <strong>Tesseract.js</strong> diretamente no seu computador para extrair o texto, sem envio de imagens ao Gemini ou servidores externos.
+              O arquivo <strong>{ocrModalDoc.name}</strong> é um PDF ou imagem com páginas digitalizadas. O CorpusLab executará o motor <strong>Tesseract.js</strong> de forma local e determinística, preservando páginas que já possuem texto nativo e convertendo apenas o material digitalizado.
             </p>
 
             <div className="space-y-1.5">
-              <label className="text-xs font-medium text-slate-700">Idioma principal do documento:</label>
+              <label className="text-xs font-medium text-slate-700">Idioma do documento para OCR:</label>
               <div className="flex gap-3 text-xs">
                 <label className="flex items-center gap-1.5 cursor-pointer">
                   <input
                     type="radio"
                     name="ocrLang"
+                    disabled={isOcrRunning}
                     checked={ocrLanguage === 'por'}
                     onChange={() => setOcrLanguage('por')}
                   />
@@ -461,6 +520,7 @@ export const ImportView: React.FC<ImportViewProps> = ({
                   <input
                     type="radio"
                     name="ocrLang"
+                    disabled={isOcrRunning}
                     checked={ocrLanguage === 'eng'}
                     onChange={() => setOcrLanguage('eng')}
                   />
@@ -469,37 +529,82 @@ export const ImportView: React.FC<ImportViewProps> = ({
               </div>
             </div>
 
-            {isOcrRunning && (
-              <div className="space-y-2 pt-2">
-                <div className="flex justify-between text-xs text-slate-500">
-                  <span>Reconhecendo caracteres...</span>
-                  <span className="font-mono">{ocrProgress}%</span>
+            {/* Missing Blob Selector (Fallback) */}
+            {ocrStatusText.includes('não encontrado') && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 space-y-2">
+                <div className="flex items-center gap-1.5 font-semibold">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span>Selecione o arquivo PDF original para OCR</span>
                 </div>
-                <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                <p>O arquivo binário não está no cache local. Selecione-o novamente no seu disco:</p>
+                <input
+                  type="file"
+                  accept=".pdf,image/*"
+                  onChange={(e) => {
+                    if (e.target.files?.[0]) {
+                      setOcrMissingFile(e.target.files[0]);
+                      setOcrStatusText('Arquivo carregado. Clique em "Iniciar OCR" para prosseguir.');
+                    }
+                  }}
+                  className="text-xs w-full text-slate-700"
+                />
+              </div>
+            )}
+
+            {/* OCR Progress Indicator */}
+            {isOcrRunning && (
+              <div className="space-y-2 pt-2 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                <div className="flex justify-between text-xs text-slate-600 font-medium">
+                  <span className="truncate pr-2">{ocrStatusText || 'Processando OCR...'}</span>
+                  <span className="font-mono text-blue-700 shrink-0">{ocrProgress}%</span>
+                </div>
+                <div className="w-full bg-slate-200 rounded-full h-2 overflow-hidden">
                   <div
-                    className="bg-blue-600 h-1.5 rounded-full transition-all duration-300"
+                    className="bg-blue-600 h-2 rounded-full transition-all duration-300"
                     style={{ width: `${ocrProgress}%` }}
                   />
                 </div>
               </div>
             )}
 
+            {!isOcrRunning && ocrStatusText && !ocrStatusText.includes('não encontrado') && (
+              <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800">
+                {ocrStatusText}
+              </div>
+            )}
+
             <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
-              <button
-                disabled={isOcrRunning}
-                onClick={() => setOcrModalDoc(null)}
-                className="px-3 py-1.5 text-xs text-slate-600 hover:text-slate-800 rounded cursor-pointer"
-              >
-                Cancelar
-              </button>
-              <button
-                disabled={isOcrRunning}
-                onClick={handleStartOcr}
-                className="px-4 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded shadow-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-              >
-                {isOcrRunning && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                {isOcrRunning ? 'Executando OCR...' : 'Confirmar e Iniciar OCR'}
-              </button>
+              {isOcrRunning ? (
+                <button
+                  type="button"
+                  onClick={handleCancelOcr}
+                  className="px-3.5 py-1.5 text-xs font-semibold text-red-600 hover:text-red-700 bg-red-50 hover:bg-red-100 rounded cursor-pointer transition-colors"
+                >
+                  Cancelar OCR
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOcrModalDoc(null);
+                    setOcrMissingFile(null);
+                    setOcrStatusText('');
+                  }}
+                  className="px-3 py-1.5 text-xs text-slate-600 hover:text-slate-800 rounded cursor-pointer"
+                >
+                  Fechar
+                </button>
+              )}
+
+              {!isOcrRunning && (
+                <button
+                  type="button"
+                  onClick={handleStartOcr}
+                  className="px-4 py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded shadow-xs flex items-center gap-1.5 cursor-pointer"
+                >
+                  Iniciar OCR Real
+                </button>
+              )}
             </div>
           </div>
         </div>

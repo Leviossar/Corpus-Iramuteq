@@ -50,6 +50,54 @@ export function runAllAutomatedTests(): TestResultItem[] {
     details: `Entrada: "${lexicalHyphen}" -> Saída: "${lexicalHyphenOutput.cleanedText}"`,
   });
 
+  // Test 1.2b: Preservação de compostos científicos (político-econômico)
+  const compoundHyphen = 'O cenário político-\neconômico brasileiro';
+  const compoundOutput = fixLineBreakHyphenation(compoundHyphen);
+  results.push({
+    id: 'norm_2b',
+    category: 'Normalização',
+    name: 'Preservação de composto lexical (político-econômico)',
+    passed: compoundOutput.cleanedText.includes('político-econômico'),
+    details: `Entrada: "${compoundHyphen}" -> Saída: "${compoundOutput.cleanedText}"`,
+  });
+
+  // Test 1.2c: Preservação de ênclise verbal (recomenda-se)
+  const encliticHyphen = 'Neste sentido, recomenda-\nse a revisão periódica';
+  const encliticOutput = fixLineBreakHyphenation(encliticHyphen);
+  results.push({
+    id: 'norm_2c',
+    category: 'Normalização',
+    name: 'Preservação de ênclise pronominal (recomenda-se)',
+    passed: encliticOutput.cleanedText.includes('recomenda-se'),
+    details: `Entrada: "${encliticHyphen}" -> Saída: "${encliticOutput.cleanedText}"`,
+  });
+
+  // Test 1.2d: Junção segura de translineação (desenvolvimento)
+  const translineationHyphen = 'O desenvolvi-\nmento sustentável';
+  const translineationOutput = fixLineBreakHyphenation(translineationHyphen);
+  results.push({
+    id: 'norm_2d',
+    category: 'Normalização',
+    name: 'Junção segura de palavra com sufixo (desenvolvimento)',
+    passed: translineationOutput.cleanedText.includes('desenvolvimento'),
+    details: `Entrada: "${translineationHyphen}" -> Saída: "${translineationOutput.cleanedText}"`,
+  });
+
+  // Test 1.2e: Hifenização ambígua Nível C (avaliação-institucional)
+  const ambHyphen = 'O processo de avaliação-\ninstitucional contínua';
+  const ambOutput = fixLineBreakHyphenation(ambHyphen);
+  results.push({
+    id: 'norm_2e',
+    category: 'Normalização',
+    name: 'Classificação conservadora de ambiguidade Nível C (avaliação-institucional)',
+    passed:
+      ambOutput.cleanedText.includes('avaliação-institucional') &&
+      ambOutput.ambiguousItems.length === 1 &&
+      ambOutput.ambiguousItems[0].status === 'pending' &&
+      ambOutput.ambiguousItems[0].line >= 1,
+    details: `Preservado: "${ambOutput.cleanedText}" | Caso sinalizado para revisão: ${ambOutput.ambiguousItems.length}`,
+  });
+
   // Test 1.3: Reconstrução de parágrafos sem quebras artificiais
   const brokenLines = 'Este é o primeiro fragmento de uma frase longa\nque continuava na linha seguinte.\n\nNovo parágrafo aqui.';
   const recParOutput = reconstructParagraphs(brokenLines);
@@ -213,8 +261,8 @@ export function runAllAutomatedTests(): TestResultItem[] {
     type: 'pdf',
     corpusMode: 'articles',
     rawText: 'Conteúdo do artigo de teste.',
-    cleanedText: 'A educação_empreendedora impulsiona os resultados.',
-    reviewedText: 'A educação_empreendedora impulsiona os resultados.',
+    cleanedText: 'A educação_empreendedora impulsiona os resultados das pesquisas científicas contemporâneas nas organizações brasileiras com elevado impacto metodológico e analítico. Este estudo investiga a percepção de gestores e pesquisadores a respeito dos processos de inovação tecnológica e transferência de conhecimento no ambiente universitário, demonstrando que a integração entre pós-graduação e mercado produtivo gera benefícios econômicos substanciais.',
+    reviewedText: 'A educação_empreendedora impulsiona os resultados das pesquisas científicas contemporâneas nas organizações brasileiras com elevado impacto metodológico e analítico. Este estudo investiga a percepção de gestores e pesquisadores a respeito dos processos de inovação tecnológica e transferência de conhecimento no ambiente universitário, demonstrando que a integração entre pós-graduação e mercado produtivo gera benefícios econômicos substanciais.',
     status: 'reviewed',
     metadata: {
       title: 'Artigo Teste',

@@ -35,9 +35,15 @@ import { ValidationExportView } from './components/ValidationExportView';
 import { TestsModal } from './components/TestsModal';
 import { ClearDataModal } from './components/ClearDataModal';
 
-const APP_DOCS_KEY = 'corpuslab_documents_v1';
-const APP_EXPRS_KEY = 'corpuslab_expressions_v1';
-const APP_TRANS_KEY = 'corpuslab_transformations_v1';
+import {
+  loadAllPersistedData,
+  persistDocuments,
+  persistExpressions,
+  persistTransformations,
+  clearProjectStores,
+  removeFileBlob,
+  setAppConfig,
+} from './utils/db';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
@@ -46,44 +52,13 @@ export default function App() {
   const [isClearModalOpen, setIsClearModalOpen] = useState<boolean>(false);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
 
-  // Initialize documents: load from localStorage or default to SAMPLE_ARTICLES
-  const [documents, setDocuments] = useState<DocumentItem[]>(() => {
-    try {
-      const stored = localStorage.getItem(APP_DOCS_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {
-      console.warn('Erro ao carregar documentos do storage:', e);
-    }
-    return SAMPLE_ARTICLES;
-  });
+  // Storage readiness to prevent race conditions during hydration
+  const [isStorageReady, setIsStorageReady] = useState<boolean>(false);
 
-  // Initialize expressions
-  const [expressions, setExpressions] = useState<LexicalExpression[]>(() => {
-    try {
-      const stored = localStorage.getItem(APP_EXPRS_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch (e) {
-      console.warn('Erro ao carregar expressões do storage:', e);
-    }
-    const dict = initializeDefaultDictionary(SAMPLE_ARTICLES);
-    const stats = extractStatisticalCandidates(SAMPLE_ARTICLES, dict);
-    return [...dict, ...stats];
-  });
-
-  // Transformations log
-  const [transformations, setTransformations] = useState<TransformationRecord[]>(() => {
-    try {
-      const stored = localStorage.getItem(APP_TRANS_KEY);
-      if (stored) return JSON.parse(stored);
-    } catch {}
-    return [];
-  });
+  // Managed application state
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [expressions, setExpressions] = useState<LexicalExpression[]>([]);
+  const [transformations, setTransformations] = useState<TransformationRecord[]>([]);
 
   // Token budget state
   const [budget, setBudget] = useState<TokenBudgetState>(() => loadTokenBudget());
@@ -99,32 +74,73 @@ export default function App() {
     setTimeout(() => setToastMessage(null), 5000);
   };
 
-  // Persist documents on change
+  // Lifecycle: Hydrate state asynchronously from IndexedDB
   useEffect(() => {
-    try {
-      localStorage.setItem(APP_DOCS_KEY, JSON.stringify(documents));
-    } catch (e) {
-      console.warn('Erro ao salvar documentos:', e);
+    let isCancelled = false;
+
+    async function initializeWorkspace() {
+      try {
+        const stored = await loadAllPersistedData();
+        if (isCancelled) return;
+
+        if (stored.isInitialized) {
+          // Project exists: load exactly what user has (even if user deliberately emptied it)
+          setDocuments(stored.documents);
+          setExpressions(stored.expressions);
+          setTransformations(stored.transformations);
+          if (stored.documents.length > 0) {
+            setSelectedDocId(stored.documents[0].id);
+          }
+        } else {
+          // Brand new user workspace: populate default sample articles
+          setDocuments(SAMPLE_ARTICLES);
+          setSelectedDocId(SAMPLE_ARTICLES[0].id);
+
+          const dict = initializeDefaultDictionary(SAMPLE_ARTICLES);
+          const stats = extractStatisticalCandidates(SAMPLE_ARTICLES, dict);
+          const initialExprs = [...dict, ...stats];
+          setExpressions(initialExprs);
+          setTransformations([]);
+
+          // Persist the default dataset to IndexedDB
+          await persistDocuments(SAMPLE_ARTICLES);
+          await persistExpressions(initialExprs);
+          await persistTransformations([]);
+          await setAppConfig('project_initialized', true);
+        }
+      } catch (err) {
+        console.warn('Erro ao inicializar espaço de trabalho via IndexedDB:', err);
+      } finally {
+        if (!isCancelled) {
+          setIsStorageReady(true);
+        }
+      }
     }
-  }, [documents]);
+
+    initializeWorkspace();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  // Persist documents on change (Only after hydration to prevent empty overwrite)
+  useEffect(() => {
+    if (!isStorageReady) return;
+    persistDocuments(documents).catch((e) => console.warn('Erro ao persistir documentos:', e));
+  }, [documents, isStorageReady]);
 
   // Persist expressions on change
   useEffect(() => {
-    try {
-      localStorage.setItem(APP_EXPRS_KEY, JSON.stringify(expressions));
-    } catch (e) {
-      console.warn('Erro ao salvar expressões:', e);
-    }
-  }, [expressions]);
+    if (!isStorageReady) return;
+    persistExpressions(expressions).catch((e) => console.warn('Erro ao persistir expressões:', e));
+  }, [expressions, isStorageReady]);
 
   // Persist transformations on change
   useEffect(() => {
-    try {
-      localStorage.setItem(APP_TRANS_KEY, JSON.stringify(transformations));
-    } catch (e) {
-      console.warn('Erro ao salvar transformações:', e);
-    }
-  }, [transformations]);
+    if (!isStorageReady) return;
+    persistTransformations(transformations).catch((e) => console.warn('Erro ao persistir transformações:', e));
+  }, [transformations, isStorageReady]);
 
   // Handlers
   const handleLoadSampleArticles = () => {
@@ -193,14 +209,15 @@ export default function App() {
   };
 
   const handleRemoveDocument = (id: string) => {
-    setDocuments(documents.filter((d) => d.id !== id));
+    setDocuments((prev) => prev.filter((d) => d.id !== id));
+    removeFileBlob(id).catch(() => {});
     if (selectedDocId === id) {
       setSelectedDocId(null);
     }
-    showToast('Documento removido.');
+    showToast('Documento removido do projeto.');
   };
 
-  const handleConfirmClear = (options: {
+  const handleConfirmClear = async (options: {
     clearDocuments: boolean;
     resetDictionary: boolean;
     clearHistory: boolean;
@@ -208,25 +225,32 @@ export default function App() {
     if (options.clearDocuments) {
       setDocuments([]);
       setSelectedDocId(null);
-      localStorage.removeItem(APP_DOCS_KEY);
+      try {
+        localStorage.removeItem('corpuslab_documents_v1');
+      } catch {}
     }
 
     if (options.clearHistory) {
       setTransformations([]);
-      localStorage.removeItem(APP_TRANS_KEY);
+      try {
+        localStorage.removeItem('corpuslab_transformations_v1');
+      } catch {}
     }
 
     if (options.resetDictionary) {
       const defaultDict = initializeDefaultDictionary([]);
       setExpressions(defaultDict);
-      localStorage.removeItem(APP_EXPRS_KEY);
+      try {
+        localStorage.removeItem('corpuslab_expressions_v1');
+      } catch {}
     }
 
-    showToast('As informações selecionadas foram limpas com sucesso.');
+    await clearProjectStores(options);
+    showToast('As informações selecionadas foram limpas com sucesso no banco de dados local.');
   };
 
   const handleUpdateDocument = (updatedDoc: DocumentItem) => {
-    setDocuments(documents.map((d) => (d.id === updatedDoc.id ? updatedDoc : d)));
+    setDocuments((prev) => prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d)));
   };
 
   // Validation report
@@ -273,6 +297,7 @@ export default function App() {
           <ImportView
             documents={documents}
             onAddDocuments={handleAddDocuments}
+            onUpdateDocument={handleUpdateDocument}
             onRemoveDocument={handleRemoveDocument}
             onClearAll={() => setIsClearModalOpen(true)}
             onSelectDocumentForEdit={(id) => {

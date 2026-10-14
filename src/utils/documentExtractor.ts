@@ -34,12 +34,13 @@ export interface OcrProgressUpdate {
  */
 function reconstructPageText(
   items: Array<{ str: string; transform: number[]; width: number; height: number }>,
-  pageWidth: number
+  pageWidth: number,
+  pageHeight: number
 ): { text: string; isTwoColumn: boolean; warningDetails?: string } {
   if (items.length === 0) return { text: '', isTwoColumn: false };
 
   const midX = pageWidth / 2;
-  const colMargin = 35; // margin around the central gutter
+  const colMargin = 30; // margin around the central gutter
 
   // Categorize items: spanning full-width, left column, or right column
   const leftItems: typeof items = [];
@@ -52,7 +53,7 @@ function reconstructPageText(
     const width = item.width || 0;
 
     // Item spans across the center gutter
-    if (x < midX - colMargin && x + width > midX + colMargin && width > pageWidth * 0.5) {
+    if (x < midX - colMargin && x + width > midX + colMargin && width > pageWidth * 0.45) {
       spanningItems.push(item);
     } else if (x + width / 2 < midX) {
       leftItems.push(item);
@@ -62,12 +63,14 @@ function reconstructPageText(
   }
 
   // Two-column criteria: both columns have substantial text blocks
-  const isTwoColumn = leftItems.length >= 10 && rightItems.length >= 10;
+  const isTwoColumn = leftItems.length >= 8 && rightItems.length >= 8;
 
   const sortTopToBottom = (list: typeof items) =>
     [...list].sort((a, b) => {
+      // In PDF coordinate space, transform[5] (Y) increases from bottom to top.
+      // Therefore, higher Y corresponds to the top of the page.
       const yDiff = b.transform[5] - a.transform[5];
-      if (Math.abs(yDiff) > 6) return yDiff;
+      if (Math.abs(yDiff) > 5) return yDiff;
       return a.transform[4] - b.transform[4];
     });
 
@@ -97,11 +100,19 @@ function reconstructPageText(
     return { text: renderTextFlow(sorted), isTwoColumn: false };
   }
 
-  // If two columns: first render any top spanning titles, then left column, then right column
-  const sortedSpanningTop = sortTopToBottom(spanningItems.filter((i) => i.transform[5] > pageWidth * 0.7));
+  // If two columns:
+  // - Top spanning titles/abstracts: Y >= pageHeight * 0.65
+  // - Columnar text: left column top-to-bottom, then right column top-to-bottom
+  // - Bottom spanning elements (footnotes, references spanning width): Y < pageHeight * 0.35
+  // - Mid spanning elements: between 0.35 and 0.65
+  const sortedSpanningTop = sortTopToBottom(
+    spanningItems.filter((i) => i.transform[5] >= pageHeight * 0.65)
+  );
   const sortedLeft = sortTopToBottom(leftItems);
   const sortedRight = sortTopToBottom(rightItems);
-  const sortedSpanningBottom = sortTopToBottom(spanningItems.filter((i) => i.transform[5] <= pageWidth * 0.7));
+  const sortedSpanningBottom = sortTopToBottom(
+    spanningItems.filter((i) => i.transform[5] < pageHeight * 0.65)
+  );
 
   const pageText = [
     renderTextFlow(sortedSpanningTop),
@@ -153,7 +164,11 @@ export async function extractTextFromPdf(file: File): Promise<ExtractedDocumentR
       scannedPagesCount++;
     }
 
-    const { text: pageText, isTwoColumn, warningDetails } = reconstructPageText(items, viewport.width);
+    const { text: pageText, isTwoColumn, warningDetails } = reconstructPageText(
+      items,
+      viewport.width,
+      viewport.height
+    );
     if (isTwoColumn) {
       hasTwoColumnsWarning = true;
       if (!columnDetails) columnDetails = warningDetails || '';
@@ -188,33 +203,61 @@ export async function runRealMultiPageOcr(
 ): Promise<{ text: string; stats: DocumentOcrStats }> {
   let worker: Worker | null = null;
 
+  const onAbort = () => {
+    if (worker) {
+      try {
+        worker.terminate();
+      } catch {}
+    }
+  };
+
+  if (abortSignal) {
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+  }
+
   try {
+    if (abortSignal?.aborted) {
+      throw new Error('Operação de OCR cancelada pelo usuário.');
+    }
+
     const arrayBuffer = await fileOrBlob.arrayBuffer();
-    const isPdf = fileOrBlob.type === 'application/pdf' || ('name' in fileOrBlob && (fileOrBlob as File).name.endsWith('.pdf'));
+    const isPdf =
+      fileOrBlob.type === 'application/pdf' ||
+      ('name' in fileOrBlob && (fileOrBlob as File).name.toLowerCase().endsWith('.pdf'));
 
     if (!isPdf) {
       // Single image OCR
       if (onProgress) onProgress({ currentPage: 1, totalPages: 1, percent: 10, statusText: 'Iniciando Tesseract OCR...' });
       worker = await createWorker(language);
 
+      if (abortSignal?.aborted) {
+        throw new Error('Operação de OCR cancelada pelo usuário.');
+      }
+
       const imageUrl = URL.createObjectURL(fileOrBlob);
-      if (onProgress) onProgress({ currentPage: 1, totalPages: 1, percent: 50, statusText: 'Reconhecendo caracteres...' });
+      try {
+        if (onProgress) onProgress({ currentPage: 1, totalPages: 1, percent: 50, statusText: 'Reconhecendo caracteres da imagem...' });
+        const ret = await worker.recognize(imageUrl);
 
-      const ret = await worker.recognize(imageUrl);
-      URL.revokeObjectURL(imageUrl);
+        if (abortSignal?.aborted) {
+          throw new Error('Operação de OCR cancelada pelo usuário.');
+        }
 
-      if (onProgress) onProgress({ currentPage: 1, totalPages: 1, percent: 100, statusText: 'Concluído' });
+        if (onProgress) onProgress({ currentPage: 1, totalPages: 1, percent: 100, statusText: 'Concluído' });
 
-      return {
-        text: ret.data.text.trim(),
-        stats: {
-          totalPages: 1,
-          ocrPages: 1,
-          nativePages: 0,
-          failedPages: [],
-          language,
-        },
-      };
+        return {
+          text: ret.data.text.trim(),
+          stats: {
+            totalPages: 1,
+            ocrPages: 1,
+            nativePages: 0,
+            failedPages: [],
+            language,
+          },
+        };
+      } finally {
+        URL.revokeObjectURL(imageUrl);
+      }
     }
 
     // PDF Multi-page processing
@@ -240,8 +283,8 @@ export async function runRealMultiPageOcr(
       const selectableChars = items.reduce((acc, it) => acc + (it.str?.trim()?.length || 0), 0);
 
       // If page already has rich selectable text, preserve it directly without lossy OCR
-      if (selectableChars >= 50) {
-        const { text } = reconstructPageText(items, viewport.width);
+      if (selectableChars >= 35) {
+        const { text } = reconstructPageText(items, viewport.width, viewport.height);
         pageTexts.push(text);
         nativePagesCount++;
 
@@ -264,15 +307,20 @@ export async function runRealMultiPageOcr(
             currentPage: pageNum,
             totalPages,
             percent: Math.round(((pageNum - 0.5) / totalPages) * 100),
-            statusText: `Inicializando motor Tesseract (${language === 'por' ? 'Português' : 'Inglês'})...`,
+            statusText: `Inicializando motor Tesseract local (${language === 'por' ? 'Português' : 'Inglês'})...`,
           });
         }
         worker = await createWorker(language);
       }
 
+      if (abortSignal?.aborted) {
+        throw new Error('Operação de OCR cancelada pelo usuário.');
+      }
+
+      let canvas: HTMLCanvasElement | null = null;
       try {
         const renderViewport = page.getViewport({ scale: 2.0 }); // High resolution for OCR precision
-        const canvas = document.createElement('canvas');
+        canvas = document.createElement('canvas');
         canvas.width = renderViewport.width;
         canvas.height = renderViewport.height;
         const ctx = canvas.getContext('2d');
@@ -282,13 +330,17 @@ export async function runRealMultiPageOcr(
         await page.render({ canvasContext: ctx, viewport: renderViewport, canvas } as any).promise;
         const pageImageUrl = canvas.toDataURL('image/png');
 
+        if (abortSignal?.aborted) {
+          throw new Error('Operação de OCR cancelada pelo usuário.');
+        }
+
         if (onProgress) {
           const percent = Math.round(((pageNum - 0.2) / totalPages) * 100);
           onProgress({
             currentPage: pageNum,
             totalPages,
             percent,
-            statusText: `Reconhecendo caracteres da página ${pageNum} de ${totalPages}...`,
+            statusText: `Reconhecendo caracteres da página digitalizada ${pageNum} de ${totalPages}...`,
           });
         }
 
@@ -301,9 +353,18 @@ export async function runRealMultiPageOcr(
         } else {
           failedPages.push(pageNum);
         }
-      } catch (pageErr) {
+      } catch (pageErr: any) {
+        if (abortSignal?.aborted) {
+          throw new Error('Operação de OCR cancelada pelo usuário.');
+        }
         console.error(`Falha no OCR da página ${pageNum}:`, pageErr);
         failedPages.push(pageNum);
+      } finally {
+        if (canvas) {
+          canvas.width = 0;
+          canvas.height = 0;
+          canvas = null;
+        }
       }
 
       if (onProgress) {
@@ -330,6 +391,9 @@ export async function runRealMultiPageOcr(
       },
     };
   } finally {
+    if (abortSignal) {
+      abortSignal.removeEventListener('abort', onAbort);
+    }
     // ALWAYS release worker and memory resources
     if (worker) {
       try {
