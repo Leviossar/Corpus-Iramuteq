@@ -123,13 +123,16 @@ export const ImportView: React.FC<ImportViewProps> = ({
 
         const item: DocumentItem = {
           id: generatedId,
+          exportId: generatedId,
           name: file.name,
           size: file.size,
           type: (ext as any) || 'txt',
           corpusMode: 'articles',
           rawText: extractedText,
-          cleanedText: cleaned,
-          reviewedText: cleaned,
+          normalizedText: cleaned.normalizedText,
+          sectionCleanedText: cleaned.sectionCleanedText,
+          cleanedText: cleaned.sectionCleanedText,
+          reviewedText: cleaned.sectionCleanedText,
           status: 'processed',
           metadata: {
             title: detectedSections.title || file.name.replace(/\.[^/.]+$/, ''),
@@ -179,8 +182,10 @@ export const ImportView: React.FC<ImportViewProps> = ({
       const cleaned = processFullDocumentCleaning(simulatedOcrText, ocrModalDoc.exclusionSettings, detected);
 
       ocrModalDoc.rawText = simulatedOcrText;
-      ocrModalDoc.cleanedText = cleaned;
-      ocrModalDoc.reviewedText = cleaned;
+      ocrModalDoc.normalizedText = cleaned.normalizedText;
+      ocrModalDoc.sectionCleanedText = cleaned.sectionCleanedText;
+      ocrModalDoc.cleanedText = cleaned.sectionCleanedText;
+      ocrModalDoc.reviewedText = cleaned.sectionCleanedText;
       ocrModalDoc.isScannedPdf = false;
       ocrModalDoc.ocrApplied = true;
 

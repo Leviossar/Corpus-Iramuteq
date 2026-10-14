@@ -96,13 +96,16 @@ export const PrepareTextView: React.FC<PrepareTextViewProps> = ({
     setExclusions(newSettings);
     const detected = detectAcademicSections(currentDoc.rawText);
     const freshlyCleaned = processFullDocumentCleaning(currentDoc.rawText, newSettings, detected);
-    handleTextChange(freshlyCleaned);
+    const cleanedStr = freshlyCleaned.sectionCleanedText;
+    handleTextChange(cleanedStr);
 
     onUpdateDocument({
       ...currentDoc,
       exclusionSettings: newSettings,
-      cleanedText: freshlyCleaned,
-      reviewedText: freshlyCleaned,
+      normalizedText: freshlyCleaned.normalizedText,
+      sectionCleanedText: cleanedStr,
+      cleanedText: cleanedStr,
+      reviewedText: cleanedStr,
     });
   };
 

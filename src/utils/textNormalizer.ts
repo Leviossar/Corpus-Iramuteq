@@ -1,8 +1,31 @@
-import { DocumentSections, ExclusionSettings } from '../types/corpus';
+import { AmbiguousCorrectionItem, DocumentSections, ExclusionSettings } from '../types/corpus';
+
+// Known Portuguese prefixes that require hyphen under the orthographic agreement
+const HYPHEN_PREFIXES = new Set([
+  'pós', 'pré', 'pró', 'recém', 'além', 'aquém', 'sem', 'ex',
+  'vice', 'sob', 'sub', 'inter', 'super', 'hiper', 'anti', 'auto',
+  'co', 'contra', 'infra', 'ultra', 'micro', 'macro', 'multi',
+]);
+
+// Common compound roots & adjectives that preserve hyphenation across line breaks
+const COMPOUND_ROOTS = new Set([
+  'político', 'politico', 'sócio', 'socio', 'econômico', 'economico',
+  'físico', 'fisico', 'químico', 'quimico', 'técnico', 'tecnico',
+  'científico', 'cientifico', 'histórico', 'historico', 'social',
+  'luso', 'afro', 'ítalo', 'franco', 'anglo', 'euro', 'latino',
+  'médico', 'medico', 'hospitalar', 'psico', 'pedagógico', 'pedagogico',
+  'norte', 'sul', 'centro', 'leste', 'oeste', 'segunda', 'terça', 'quarta',
+  'quinta', 'sexta', 'feira',
+]);
+
+// Common Portuguese verbal enclitics (pronomes oblíquos átonos)
+const ENCLITICS = new Set([
+  'se', 'lhe', 'lhes', 'nos', 'me', 'te', 'vos', 'o', 'a', 'os', 'as',
+  'lo', 'la', 'los', 'las', 'no', 'na', 'nos', 'nas',
+]);
 
 /**
- * Normalizes unicode text to NFC and performs deterministic academic text sanitization
- * for IRaMuTeQ compatibility without altering scientific meaning or diacritics.
+ * Normalizes unicode text to NFC (Tier A: Safe deterministic transformation)
  */
 export function normalizeUnicodeNFC(text: string): string {
   if (!text) return '';
@@ -10,35 +33,91 @@ export function normalizeUnicodeNFC(text: string): string {
 }
 
 /**
- * Repairs de-hyphenation across line breaks:
- * e.g., "desenvolvi-\nmento" -> "desenvolvimento"
- * BUT preserves true lexical hyphens: e.g. "segunda-feira" or "sócio-econômico"
+ * Removes non-printable, zero-width, and control characters while preserving standard Portuguese punctuation (Tier A)
  */
-export function fixLineBreakHyphenation(text: string): string {
+export function cleanInvisibleCharacters(text: string): string {
   if (!text) return '';
 
-  // Matches word fragment ending in hyphen or soft hyphen followed by newline and next word fragment
-  // Handles soft-hyphen \u00AD, standard hyphen -, non-breaking hyphen \u2011
-  return text.replace(/([\p{L}]+)[-\u00AD\u2011]\s*[\r\n]+\s*([\p{L}]+)/gu, (match, p1, p2) => {
-    // If lowercased suffix is a common grammatical enclitic (e.g. "se", "lhe", "nos", "o", "a", "os", "as"),
-    // preserve hyphen without newline: "recomenda-se"
-    const enclitics = ['se', 'lhe', 'lhes', 'nos', 'me', 'te', 'vos', 'o', 'a', 'os', 'as', 'lo', 'la', 'los', 'las', 'no', 'na', 'nos', 'nas'];
-    if (enclitics.includes(p2.toLowerCase())) {
-      return `${p1}-${p2}`;
-    }
-    // Check if it's a recognized compound with hyphen like "segunda-feira"
-    const combinedHyphen = `${p1}-${p2}`.toLowerCase();
-    if (combinedHyphen.includes('feira')) {
-      return `${p1}-${p2}`;
-    }
-    // Otherwise it was an artificial hyphenation caused by justification / translineation
-    return `${p1}${p2}`;
-  });
+  return (
+    text
+      // Remove zero-width spaces, joiners, directional marks, soft hyphens
+      .replace(/[\u200B-\u200D\uFEFF\u00A0\u200E\u200F]/g, ' ')
+      // Normalize curly quotes to standard forms
+      .replace(/[“”«»]/g, '"')
+      .replace(/[‘’‚‛]/g, "'")
+      // Normalize em-dash / en-dash surrounded by spaces to hyphen
+      .replace(/\s*[—–]\s*/g, ' - ')
+      // Remove control characters except newline and tab
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+      // Normalize multiple horizontal spaces to single space
+      .replace(/[ \t]+/g, ' ')
+  );
 }
 
 /**
- * Reconstructs continuous paragraphs from fragmented line breaks:
- * Lines ending without sentence-ending punctuation (. ? ! : ) are merged into a single line.
+ * Repairs de-hyphenation across line breaks with 3-tier safety classification:
+ * - Tier A/B: Preserves genuine lexical hyphens:
+ *   "político-\neconômico" -> "político-econômico"
+ *   "recomenda-\nse" -> "recomenda-se"
+ *   "pós-\ngraduação" -> "pós-graduação"
+ * - Reconstructs broken single words:
+ *   "desenvolvi-\nmento" -> "desenvolvimento"
+ * - Tier C: Ambiguous cases are recorded for researcher review
+ */
+export function fixLineBreakHyphenation(text: string): {
+  cleanedText: string;
+  ambiguousItems: AmbiguousCorrectionItem[];
+} {
+  if (!text) return { cleanedText: '', ambiguousItems: [] };
+
+  const ambiguousItems: AmbiguousCorrectionItem[] = [];
+  let lineCounter = 1;
+
+  const cleanedText = text.replace(
+    /([\p{L}]+)[-\u00AD\u2011]\s*[\r\n]+\s*([\p{L}]+)/gu,
+    (match, p1: string, p2: string, offset: number) => {
+      const lower1 = p1.toLowerCase();
+      const lower2 = p2.toLowerCase();
+
+      // Case 1: Enclitic pronoun (e.g. "recomenda-se", "observa-se")
+      if (ENCLITICS.has(lower2)) {
+        return `${p1}-${p2}`;
+      }
+
+      // Case 2: Prefixes that require hyphen (e.g. "pós-graduação", "pré-requisito")
+      if (HYPHEN_PREFIXES.has(lower1)) {
+        return `${p1}-${p2}`;
+      }
+
+      // Case 3: Recognized compound adjectives & roots (e.g. "político-econômico", "sócio-econômico", "segunda-feira")
+      if (COMPOUND_ROOTS.has(lower1) || COMPOUND_ROOTS.has(lower2) || lower2 === 'feira') {
+        return `${p1}-${p2}`;
+      }
+
+      // Case 4: Ambiguous compound check (both parts are independent Portuguese words with length >= 4)
+      if (p1.length >= 4 && p2.length >= 4 && !lower1.endsWith('ando') && !lower1.endsWith('endo')) {
+        // Flag for human review
+        const item: AmbiguousCorrectionItem = {
+          id: `amb_${offset}`,
+          original: `${p1}-${p2}`,
+          suggested: `${p1}${p2}`,
+          line: lineCounter,
+          context: match.replace(/\s+/g, ' '),
+          status: 'pending',
+        };
+        ambiguousItems.push(item);
+      }
+
+      // Standard translineation word repair (e.g. "desenvolvi-\nmento" -> "desenvolvimento")
+      return `${p1}${p2}`;
+    }
+  );
+
+  return { cleanedText, ambiguousItems };
+}
+
+/**
+ * Reconstructs continuous paragraphs from broken lines while respecting punctuation and headings
  */
 export function reconstructParagraphs(text: string): string {
   if (!text) return '';
@@ -66,12 +145,12 @@ export function reconstructParagraphs(text: string): string {
     if (!currentParagraph) {
       currentParagraph = rawLine;
     } else {
-      // If previous line ends with a typical sentence terminator, start a new sentence or join with space
-      const endsWithPunct = /[.?!:;]$/.test(currentParagraph);
-      const startsWithCapital = /^[\p{Lu}\d]/u.test(rawLine);
+      // Check if previous line ends with typical sentence terminator
+      const endsWithTerminator = /[.?!:;]$/.test(currentParagraph);
+      // Check if rawLine looks like a new section heading e.g., "1. INTRODUÇÃO"
+      const isNewHeading = /^(?:[0-9]{1,2}\.|\b[A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]{4,}\b)/.test(rawLine);
 
-      if (endsWithPunct && startsWithCapital && (lines[i - 1]?.trim() === '' || rawLine.length < 40)) {
-        // Distinct paragraph boundary
+      if (endsWithTerminator && isNewHeading) {
         reconstructed.push(currentParagraph);
         currentParagraph = rawLine;
       } else {
@@ -89,53 +168,36 @@ export function reconstructParagraphs(text: string): string {
 }
 
 /**
- * Removes non-printable, zero-width, and problematic characters while preserving standard Portuguese punctuation.
- */
-export function cleanInvisibleCharacters(text: string): string {
-  if (!text) return '';
-
-  return (
-    text
-      // Remove zero-width spaces, joiners, directional marks
-      .replace(/[\u200B-\u200D\uFEFF\u00A0\u200E\u200F]/g, ' ')
-      // Normalize curly quotes and accents to standard academic forms
-      .replace(/[“”«»]/g, '"')
-      .replace(/[‘’‚‛]/g, "'")
-      // Normalize em-dash / en-dash surrounded by spaces to hyphen
-      .replace(/\s*[—–]\s*/g, ' - ')
-      // Remove control characters except newline and tab
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-      // Normalize multiple horizontal spaces to single space
-      .replace(/[ \t]+/g, ' ')
-  );
-}
-
-/**
- * Scans the raw text to locate boundaries of common academic sections
+ * Scans the raw text to locate boundaries of academic sections with strict structural anchors:
+ * - Must be anchored on its own line
+ * - References must be in the final 60% of document to prevent chopping text in introduction
  */
 export function detectAcademicSections(text: string): DocumentSections {
   const sections: DocumentSections = {};
   if (!text) return sections;
 
-  // Title detection (usually first non-empty lines)
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (lines.length > 0) {
     sections.title = lines.slice(0, 2).join(' - ');
   }
 
-  // Detect Abstract / Resumo
-  const resumoMatch = text.match(/(?:RESUMO|ABSTRACT)[\s\S]*?(?=\n\s*(?:[1-9]\.|\bINTRODU[ÇC][ÃA]O\b|\bPALAVRAS-CHAVE\b|\bKEYWORDS\b))/i);
+  // Detect Abstract / Resumo with line-anchored heading
+  const resumoMatch = text.match(/(?:^|\n)\s*(?:RESUMO|ABSTRACT)\b[\s\S]*?(?=\n\s*(?:[1-9]\.|\bINTRODU[ÇC][ÃA]O\b|\bPALAVRAS-CHAVE\b|\bKEYWORDS\b))/i);
   if (resumoMatch) {
     sections.abstract = resumoMatch[0].trim();
   }
 
-  // Detect References / Referências
-  const refMatch = text.match(/(?:\bREFER[ÊE]NCIAS(?:\s+BIBLIOGR[ÁA]FICAS)?\b|\bREFERENCES\b)[\s\S]*$/i);
+  // Detect References with structural anchor: must be in the last 60% of document
+  const totalLen = text.length;
+  const searchStart = Math.floor(totalLen * 0.35); // only search in the second half/final portion
+  const textSub = text.substring(searchStart);
+
+  const refMatch = textSub.match(/(?:^|\n)\s*(?:[0-9]{1,2}\.?\s*)?(?:REFER[ÊE]NCIAS(?:\s+BIBLIOGR[ÁA]FICAS)?|REFERENCES)\s*(?:\n|$)[\s\S]*$/i);
   if (refMatch) {
     sections.references = refMatch[0].trim();
   }
 
-  // Detect interviewer questions count (for interviews)
+  // Detect interviewer questions in dialogue corpora
   const interviewerMatches = text.match(/(?:^|\n)\s*(?:E:|Entrevistador:|Pesquisador:|Entrevistadora:)\s*.*?(?=\n\s*(?:P\d+:|Participante|Entrevistado|\n|$))/gi);
   if (interviewerMatches) {
     sections.interviewerQuestionsCount = interviewerMatches.length;
@@ -145,7 +207,7 @@ export function detectAcademicSections(text: string): DocumentSections {
 }
 
 /**
- * Applies optional section exclusions chosen by the researcher
+ * Applies optional section exclusions chosen by the researcher with safety guards
  */
 export function applySectionExclusions(
   text: string,
@@ -155,28 +217,29 @@ export function applySectionExclusions(
   if (!text) return '';
   let result = text;
 
-  // Exclude References if enabled
+  // Exclude References only if structurally confirmed at the end of text
   if (settings.excludeReferences && detected.references) {
-    const refIndex = result.search(/(?:\bREFER[ÊE]NCIAS(?:\s+BIBLIOGR[ÁA]FICAS)?\b|\bREFERENCES\b)/i);
-    if (refIndex !== -1) {
-      result = result.substring(0, refIndex).trim();
+    const searchStart = Math.floor(result.length * 0.35);
+    const sub = result.substring(searchStart);
+    const match = sub.match(/(?:^|\n)\s*(?:[0-9]{1,2}\.?\s*)?(?:REFER[ÊE]NCIAS(?:\s+BIBLIOGR[ÁA]FICAS)?|REFERENCES)\s*(?:\n|$)/i);
+
+    if (match && match.index !== undefined) {
+      result = result.substring(0, searchStart + match.index).trim();
     }
   }
 
   // Exclude Abstract / Resumo if enabled
   if (settings.excludeAbstract) {
-    result = result.replace(/(?:^|\n)\s*(?:RESUMO|ABSTRACT)[\s\S]*?(?=\n\s*(?:[1-9]\.|\bINTRODU[ÇC][ÃA]O\b|\bPALAVRAS-CHAVE\b|\bKEYWORDS\b))/gi, '\n');
+    result = result.replace(/(?:^|\n)\s*(?:RESUMO|ABSTRACT)\b[\s\S]*?(?=\n\s*(?:[1-9]\.|\bINTRODU[ÇC][ÃA]O\b|\bPALAVRAS-CHAVE\b|\bKEYWORDS\b))/gi, '\n');
   }
 
-  // Exclude Interviewer Questions if enabled (crucial for interview corpora)
+  // Exclude Interviewer Questions if enabled (for interview corpora)
   if (settings.excludeInterviewerQuestions) {
-    // Strips out "Entrevistador: ... ?" or "E: ... ?" leaving only the participant response
     result = result.replace(/(?:^|\n)\s*(?:E:|Entrevistador:|Pesquisador:|Entrevistadora:)\s*[^\n]+(?:\?|\.|\n|$)/gi, '\n');
-    // Also clean participant prefix like "P01: " or "Participante 01: " so the text flows as clean monologue
     result = result.replace(/(?:^|\n)\s*(?:P\d+:|Participante\s*\d+:|Entrevistado\s*\d+:)\s*/gi, '\n');
   }
 
-  // Clean tables, notes and figures if requested
+  // Clean tables and figures if requested
   if (settings.excludeTables) {
     result = result.replace(/(?:^|\n)\s*(?:Tabela|Quadro|Figura|Gráfico)\s*\d+[:.\s][^\n]+/gi, '\n');
     result = result.replace(/(?:^|\n)\s*Fonte:\s*[^\n]+/gi, '\n');
@@ -197,8 +260,12 @@ export function processFullDocumentCleaning(
   rawText: string,
   settings: ExclusionSettings,
   detected: DocumentSections
-): string {
-  if (!rawText) return '';
+): {
+  normalizedText: string;
+  sectionCleanedText: string;
+  ambiguousItems: AmbiguousCorrectionItem[];
+} {
+  if (!rawText) return { normalizedText: '', sectionCleanedText: '', ambiguousItems: [] };
 
   // 1. Unicode NFC
   let text = normalizeUnicodeNFC(rawText);
@@ -206,17 +273,22 @@ export function processFullDocumentCleaning(
   // 2. Remove invisible chars
   text = cleanInvisibleCharacters(text);
 
-  // 3. Fix line-break hyphenations
-  text = fixLineBreakHyphenation(text);
+  // 3. Fix line-break hyphenations with 3-tier rules
+  const { cleanedText: dehyphenated, ambiguousItems } = fixLineBreakHyphenation(text);
+  text = dehyphenated;
 
-  // 4. Apply researcher section exclusions
-  text = applySectionExclusions(text, settings, detected);
-
-  // 5. Reconstruct paragraphs
+  // 4. Reconstruct paragraphs
   text = reconstructParagraphs(text);
+  const normalizedText = text.trim();
 
-  // 6. Clean excess empty lines (max 2 consecutive newlines)
-  text = text.replace(/\n{3,}/g, '\n\n').trim();
+  // 5. Apply researcher section exclusions
+  const sectionCleanedText = applySectionExclusions(normalizedText, settings, detected)
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 
-  return text;
+  return {
+    normalizedText,
+    sectionCleanedText,
+    ambiguousItems,
+  };
 }

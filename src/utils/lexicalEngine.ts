@@ -28,7 +28,7 @@ export function tokenizeWords(text: string): string[] {
 }
 
 /**
- * Method B: Extract statistical n-grams (2 to 5 words) across all documents
+ * Method B: Extract statistical n-grams (2 to 5 words) across all documents with NPMI association calculation
  */
 export function extractStatisticalCandidates(
   documents: DocumentItem[],
@@ -39,18 +39,37 @@ export function extractStatisticalCandidates(
     existingMap.set(expr.original.toLowerCase(), expr);
   }
 
-  const ngramCounts = new Map<string, { count: number; docs: Set<string>; sampleContexts: { docId: string; docName: string; snippet: string }[] }>();
+  const unigramCounts = new Map<string, number>();
+  let totalTokenCount = 0;
+
+  const ngramCounts = new Map<
+    string,
+    {
+      count: number;
+      docs: Set<string>;
+      words: string[];
+      sampleContexts: { docId: string; docName: string; snippet: string }[];
+    }
+  >();
 
   // Tokenize per document
   for (const doc of documents) {
-    const text = doc.cleanedText || doc.rawText;
+    const text = doc.sectionCleanedText || doc.normalizedText || doc.cleanedText || doc.rawText;
     if (!text) continue;
 
-    // Split into sentences for context extraction
     const sentences = text.split(/(?<=[.?!;])\s+/);
 
     for (const sentence of sentences) {
       const words = tokenizeWords(sentence);
+      if (words.length === 0) continue;
+
+      totalTokenCount += words.length;
+
+      // Count unigrams for PMI calculation
+      for (const w of words) {
+        unigramCounts.set(w, (unigramCounts.get(w) || 0) + 1);
+      }
+
       if (words.length < 2) continue;
 
       // Extract 2-gram, 3-gram, 4-gram, 5-gram
@@ -74,14 +93,14 @@ export function extractStatisticalCandidates(
 
           const phrase = slice.join(' ');
 
-          // Skip numbers only
-          if (/^\d+(\s+\d+)*$/.test(phrase)) {
+          // Skip numbers only or single letters
+          if (/^\d+(\s+\d+)*$/.test(phrase) || phrase.length < 4) {
             continue;
           }
 
           let entry = ngramCounts.get(phrase);
           if (!entry) {
-            entry = { count: 0, docs: new Set(), sampleContexts: [] };
+            entry = { count: 0, docs: new Set(), words: slice, sampleContexts: [] };
             ngramCounts.set(phrase, entry);
           }
 
@@ -89,7 +108,6 @@ export function extractStatisticalCandidates(
           entry.docs.add(doc.id);
 
           if (entry.sampleContexts.length < 3) {
-            // Find snippet in sentence
             const snippet = sentence.trim().length > 150 ? sentence.trim().substring(0, 150) + '...' : sentence.trim();
             if (!entry.sampleContexts.some((c) => c.snippet === snippet)) {
               entry.sampleContexts.push({
@@ -105,16 +123,33 @@ export function extractStatisticalCandidates(
   }
 
   const results: LexicalExpression[] = [];
+  const safeTotalTokens = Math.max(totalTokenCount, 100);
 
-  // Filter and compute association scores
+  // Filter and compute NPMI scores
   for (const [phrase, data] of ngramCounts.entries()) {
-    // Only consider expressions appearing at least twice across the corpus, or in multiple documents
+    // Only consider expressions appearing at least twice or across multiple documents
     if (data.count < 2 && data.docs.size < 2) {
       continue;
     }
 
-    const words = phrase.split(' ');
+    const words = data.words;
     const normalized = words.join('_');
+
+    // Compute Normalized Pointwise Mutual Information (NPMI)
+    // P(ngram) = data.count / safeTotalTokens
+    // P(w_i) = unigramCount(w_i) / safeTotalTokens
+    const pNgram = data.count / safeTotalTokens;
+    let sumLogPWords = 0;
+
+    for (const w of words) {
+      const pW = (unigramCounts.get(w) || 1) / safeTotalTokens;
+      sumLogPWords += Math.log2(pW);
+    }
+
+    const log2PNgram = Math.log2(pNgram);
+    const pmi = log2PNgram - sumLogPWords;
+    // NPMI = PMI / -log2(P(ngram))
+    const npmi = log2PNgram !== 0 ? Math.max(-1, Math.min(1, pmi / -log2PNgram)) : 0;
 
     // Check if already in dictionary or previous list
     const existing = existingMap.get(phrase);
@@ -123,19 +158,22 @@ export function extractStatisticalCandidates(
         ...existing,
         frequency: data.count,
         docCount: data.docs.size,
+        npmiScore: parseFloat(npmi.toFixed(3)),
         contexts: data.sampleContexts,
       });
       continue;
     }
 
-    // Ambiguity scoring heuristic (0 = unequivocal, 1 = highly ambiguous)
-    // Phrases with high frequency and 3+ words tend to be strong conceptual units.
-    // 2-word combinations that contain generic action verbs tend to be ambiguous.
-    let ambiguityScore = 0.3;
-    if (words.length === 2) {
-      ambiguityScore = 0.65;
-    } else if (words.length >= 3) {
-      ambiguityScore = 0.35;
+    // Ambiguity scoring heuristic
+    // High NPMI (> 0.45) indicates strong fixed phrase (low ambiguity ~0.2)
+    // Low NPMI with 2 words indicates probable free combination (high ambiguity ~0.7)
+    let ambiguityScore = 0.5;
+    if (npmi > 0.45) {
+      ambiguityScore = 0.2;
+    } else if (words.length >= 3 && npmi > 0.25) {
+      ambiguityScore = 0.3;
+    } else if (words.length === 2 && npmi < 0.2) {
+      ambiguityScore = 0.75;
     }
 
     results.push({
@@ -145,6 +183,7 @@ export function extractStatisticalCandidates(
       source: 'statistical',
       frequency: data.count,
       docCount: data.docs.size,
+      npmiScore: parseFloat(npmi.toFixed(3)),
       contexts: data.sampleContexts,
       status: 'pending',
       ambiguityScore,
@@ -155,7 +194,7 @@ export function extractStatisticalCandidates(
   // Sort by frequency descending
   results.sort((a, b) => b.frequency - a.frequency);
 
-  return results.slice(0, 100); // Top 100 candidate expressions
+  return results.slice(0, 100);
 }
 
 /**
@@ -163,15 +202,17 @@ export function extractStatisticalCandidates(
  */
 export function initializeDefaultDictionary(documents: DocumentItem[]): LexicalExpression[] {
   return DEFAULT_ACADEMIC_COMPOUND_WORDS.map((item, idx) => {
-    // Count occurrences in current corpus
     let totalFreq = 0;
     const docSet = new Set<string>();
     const contexts: { docId: string; docName: string; snippet: string }[] = [];
 
-    const regex = new RegExp(`(?<![\\p{L}\\p{N}_])${item.original}(?![\\p{L}\\p{N}_])`, 'gui');
+    // Always create a fresh RegExp instance to avoid shared lastIndex state issues
+    const escaped = item.original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'gui');
 
     for (const doc of documents) {
-      const text = doc.cleanedText || doc.rawText;
+      const text = doc.sectionCleanedText || doc.normalizedText || doc.cleanedText || doc.rawText;
+      regex.lastIndex = 0;
       const matches = text.match(regex);
       if (matches) {
         totalFreq += matches.length;
@@ -179,7 +220,10 @@ export function initializeDefaultDictionary(documents: DocumentItem[]): LexicalE
 
         if (contexts.length < 2) {
           const sentences = text.split(/(?<=[.?!])\s+/);
-          const found = sentences.find((s) => regex.test(s));
+          const found = sentences.find((s) => {
+            const singleRegex = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'ui');
+            return singleRegex.test(s);
+          });
           if (found) {
             contexts.push({
               docId: doc.id,
@@ -199,9 +243,10 @@ export function initializeDefaultDictionary(documents: DocumentItem[]): LexicalE
       frequency: totalFreq,
       docCount: docSet.size,
       contexts,
-      status: 'approved', // Pre-approved by academic dictionary
-      ambiguityScore: 0.1, // High confidence
+      status: 'approved',
+      ambiguityScore: 0.1,
       appliedCount: 0,
+      category: item.category,
       justification: `Unidade conceitual padrão do vocabulário acadêmico (${item.category}).`,
     };
   });
@@ -209,10 +254,11 @@ export function initializeDefaultDictionary(documents: DocumentItem[]): LexicalE
 
 /**
  * Applies approved compound expressions into text safely:
- * - Substitutes ONLY approved expressions
- * - Sorts by length descending to prevent substring collisions (e.g. "gestão_estratégica_de_processos" before "gestão_de_processos")
- * - Enforces Unicode word boundary lookarounds `(?<![\p{L}\p{N}_])...(?![[\p{L}\p{N}_])`
- * - Preserves accents and diacritics
+ * - Substitutes ONLY approved expressions.
+ * - Sorts by length descending to prevent substring collisions (e.g. "gestão_estratégica_de_processos" before "gestão_de_processos").
+ * - Enforces Unicode word boundary lookarounds `(?<![\p{L}\p{N}_])...(?![[\p{L}\p{N}_])` to prevent partial substitutions inside words or already unified tokens.
+ * - Preserves accents and diacritics.
+ * - Records complete audit trail in TransformationRecord.
  */
 export function applyApprovedCompoundWords(
   text: string,
@@ -233,27 +279,35 @@ export function applyApprovedCompoundWords(
   const transformations: TransformationRecord[] = [];
 
   for (const expr of sorted) {
-    // Word boundary that supports Unicode letters and underscores
+    // Avoid double substitution if already normalized
+    if (updatedText.includes(expr.normalized) && !updatedText.includes(expr.original)) {
+      continue;
+    }
+
     const escaped = expr.original.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'gui');
+    pattern.lastIndex = 0;
 
     let occurrencesCount = 0;
-    const newText = updatedText.replace(pattern, (match) => {
+    const newText = updatedText.replace(pattern, () => {
       occurrencesCount++;
-      // Match case sensitivity pattern or use defined normalized form
       return expr.normalized;
     });
 
     if (occurrencesCount > 0) {
       transformations.push({
-        id: `trans_${Math.random().toString(36).substr(2, 9)}`,
+        id: `trans_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
         timestamp: new Date().toISOString(),
         docId,
         docName,
+        stage: 'lexical_unification',
         type: 'compound_replacement',
+        ruleName: 'unificacao_lexical_iramuteq',
         description: `Unificação da expressão "${expr.original}" para "${expr.normalized}" (${occurrencesCount} ocorrência${occurrencesCount > 1 ? 's' : ''})`,
         beforeSnippet: expr.original,
         afterSnippet: expr.normalized,
+        occurrencesCount,
+        reversible: true,
       });
       updatedText = newText;
     }
@@ -263,11 +317,12 @@ export function applyApprovedCompoundWords(
 }
 
 /**
- * Reverts a specific compound expression back to its original separated form
+ * Reverts a specific compound expression back to its original separated form with boundary safety
  */
 export function revertCompoundWord(text: string, normalized: string, original: string): string {
   if (!text || !normalized || !original) return text;
   const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'gu');
+  const pattern = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'gu');
+  pattern.lastIndex = 0;
   return text.replace(pattern, original);
 }

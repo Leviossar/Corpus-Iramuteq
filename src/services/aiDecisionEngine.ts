@@ -78,6 +78,7 @@ export function loadTokenBudget(): TokenBudgetState {
     model: 'gemini-3.1-flash-lite',
     apiStatus: 'ready',
     lastStatusMessage: 'Pronto para desambiguações autorizadas.',
+    lastBudgetResetDate: new Date().toISOString().split('T')[0],
   };
 
   try {

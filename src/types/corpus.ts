@@ -1,10 +1,10 @@
 export type CorpusMode = 'articles' | 'interviews' | 'institutional';
 
-export type DocumentStatus = 'imported' | 'processed' | 'reviewed';
+export type DocumentStatus = 'imported' | 'processed' | 'pending_review' | 'reviewed';
 
 export interface DocumentMetadata {
   title: string;
-  year: string;
+  year?: string;
   authors: string;
   group: string;
   language: string;
@@ -30,23 +30,57 @@ export interface ExclusionSettings {
   excludeInterviewerQuestions: boolean; // only for interviews
 }
 
+export interface AmbiguousCorrectionItem {
+  id: string;
+  original: string;
+  suggested: string;
+  line: number;
+  context: string;
+  status: 'pending' | 'accepted' | 'rejected';
+}
+
+export interface DocumentOcrStats {
+  totalPages: number;
+  ocrPages: number;
+  nativePages: number;
+  failedPages: number[];
+  language: string;
+}
+
 export interface DocumentItem {
-  id: string; // e.g. doc_001
+  // Stable internal ID (UUID/timestamp based) that never breaks project references
+  id: string;
+  // User-facing export identifier for IRaMuTeQ **** *exportId line
+  exportId?: string;
   name: string;
   size: number;
   type: 'pdf' | 'docx' | 'doc' | 'txt';
   corpusMode: CorpusMode;
-  rawText: string;
-  cleanedText: string;
-  reviewedText: string;
+
+  // Explicit separation of text lifecycle stages
+  rawText: string;            // Stage 1: verbatim extracted content (immutable baseline)
+  normalizedText?: string;     // Stage 2: after deterministic de-hyphenation and punctuation cleanup
+  sectionCleanedText?: string; // Stage 3: after confirmed academic section exclusions
+  lexicalUnifiedText?: string; // Stage 4: after approved compound words substitution
+  reviewedText: string;       // Stage 5: final version edited/confirmed by researcher
+  cleanedText: string;        // Compatibility bridge
+
   status: DocumentStatus;
   metadata: DocumentMetadata;
   detectedSections: DocumentSections;
   exclusionSettings: ExclusionSettings;
+
   isScannedPdf?: boolean;
   ocrApplied?: boolean;
+  ocrStats?: DocumentOcrStats;
   readingOrderWarning?: boolean;
+  readingOrderDetails?: string;
+  ambiguousCorrections?: AmbiguousCorrectionItem[];
   extractedAt: string;
+  updatedAt?: string;
+
+  // Stored file reference id for re-running OCR without re-uploading
+  fileBlobKey?: string;
 }
 
 export type ExpressionSource = 'dictionary' | 'statistical' | 'gemini' | 'manual';
@@ -69,11 +103,13 @@ export interface LexicalExpression {
   contexts: ExpressionContext[];
   status: ExpressionStatus;
   ambiguityScore: number; // 0 (clear) to 1 (highly ambiguous)
+  npmiScore?: number; // Normalized Pointwise Mutual Information
   aiClassification?: AIClassification;
   aiSuggestedUnify?: boolean;
   justification?: string;
   appliedCount: number;
   isUserAdded?: boolean;
+  category?: string;
 }
 
 export interface TokenBudgetState {
@@ -89,6 +125,7 @@ export interface TokenBudgetState {
   model: string;
   apiStatus: 'ready' | 'offline' | 'exhausted' | 'rate_limited' | 'error';
   lastStatusMessage?: string;
+  lastBudgetResetDate: string; // YYYY-MM-DD
 }
 
 export interface TransformationRecord {
@@ -96,10 +133,14 @@ export interface TransformationRecord {
   timestamp: string;
   docId: string;
   docName: string;
+  stage: 'extraction' | 'normalization' | 'section_removal' | 'lexical_unification' | 'manual_edit';
   type: 'normalization' | 'section_removal' | 'compound_replacement' | 'manual_edit';
   description: string;
+  ruleName?: string;
   beforeSnippet: string;
   afterSnippet: string;
+  occurrencesCount?: number;
+  reversible: boolean;
 }
 
 export interface AILogEntry {
@@ -118,7 +159,7 @@ export interface AILogEntry {
 export interface ValidationIssue {
   id: string;
   severity: 'error' | 'warning' | 'info';
-  category: 'encoding' | 'command_line' | 'variable' | 'empty_text' | 'duplicate' | 'illegal_char' | 'pending_review';
+  category: 'encoding' | 'command_line' | 'variable' | 'empty_text' | 'duplicate' | 'illegal_char' | 'pending_review' | 'doc_format';
   docId?: string;
   docName?: string;
   line?: number;
@@ -138,9 +179,12 @@ export interface ValidationReport {
   errorsCount: number;
 }
 
-export interface CustomDictionaryEntry {
-  term: string;
-  normalized: string;
-  category: string;
-  notes?: string;
+export interface PseudonymCandidate {
+  id: string;
+  docId: string;
+  originalText: string;
+  suggestedPseudonym: string;
+  type: 'name' | 'contact' | 'identifier';
+  contextSnippet: string;
+  confirmed: boolean;
 }

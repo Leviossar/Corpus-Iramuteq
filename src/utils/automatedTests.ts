@@ -35,8 +35,8 @@ export function runAllAutomatedTests(): TestResultItem[] {
     id: 'norm_1',
     category: 'Normalização',
     name: 'Recuperação de palavras divididas por quebra de linha',
-    passed: hyphenOutput.includes('implementação') && !hyphenOutput.includes('-\n'),
-    details: `Entrada: "${hyphenInput}" -> Saída: "${hyphenOutput}"`,
+    passed: hyphenOutput.cleanedText.includes('implementação') && !hyphenOutput.cleanedText.includes('-\n'),
+    details: `Entrada: "${hyphenInput}" -> Saída: "${hyphenOutput.cleanedText}"`,
   });
 
   // Test 1.2: Preservação de hífens lexicais (segunda-feira)
@@ -46,8 +46,8 @@ export function runAllAutomatedTests(): TestResultItem[] {
     id: 'norm_2',
     category: 'Normalização',
     name: 'Preservação de hífen lexical (segunda-feira)',
-    passed: lexicalHyphenOutput.includes('segunda-feira'),
-    details: `Entrada: "${lexicalHyphen}" -> Saída: "${lexicalHyphenOutput}"`,
+    passed: lexicalHyphenOutput.cleanedText.includes('segunda-feira'),
+    details: `Entrada: "${lexicalHyphen}" -> Saída: "${lexicalHyphenOutput.cleanedText}"`,
   });
 
   // Test 1.3: Reconstrução de parágrafos sem quebras artificiais
