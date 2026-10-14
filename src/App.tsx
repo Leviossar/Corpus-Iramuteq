@@ -192,20 +192,10 @@ export default function App() {
   const handleAddDocuments = (newDocs: DocumentItem[]) => {
     const updated = [...documents, ...newDocs];
     setDocuments(updated);
-
-    // Refresh candidate statistical expressions
-    const stats = extractStatisticalCandidates(updated, expressions);
-    const existingMap = new Map(expressions.map((e) => [e.original.toLowerCase(), e]));
-
-    const merged = [...expressions];
-    for (const stat of stats) {
-      if (!existingMap.has(stat.original.toLowerCase())) {
-        merged.push(stat);
-      }
+    if (!selectedDocId && updated.length > 0) {
+      setSelectedDocId(updated[0].id);
     }
-    setExpressions(merged);
-
-    showToast(`${newDocs.length} documento(s) adicionado(s) e processado(s) localmente.`);
+    showToast(`${newDocs.length} documento(s) adicionado(s) com sucesso ao projeto.`);
   };
 
   const handleRemoveDocument = (id: string) => {

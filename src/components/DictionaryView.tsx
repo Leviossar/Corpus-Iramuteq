@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   BookOpen,
   Plus,
@@ -16,6 +16,10 @@ import {
   HelpCircle,
   Edit2,
   FileSpreadsheet,
+  ListPlus,
+  Trash2,
+  CheckSquare,
+  Save,
 } from 'lucide-react';
 import {
   DocumentItem,
@@ -25,9 +29,12 @@ import {
 import {
   applyApprovedCompoundWords,
   extractStatisticalCandidates,
+  addAllCandidateTerms,
+  normalizeExpressionKey,
 } from '../utils/lexicalEngine';
 import { classifyExpressionsBatch } from '../services/geminiService';
 import { downloadFile } from '../utils/exportManager';
+import { persistExpressions } from '../utils/db';
 
 interface DictionaryViewProps {
   expressions: LexicalExpression[];
@@ -46,7 +53,9 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
   onUpdateDocuments,
   onUpdateBudget,
 }) => {
-  const [activeFilter, setActiveFilter] = useState<'all' | 'dictionary' | 'statistical' | 'custom' | 'pending' | 'approved'>('all');
+  const [activeFilter, setActiveFilter] = useState<
+    'all' | 'dictionary' | 'statistical' | 'candidates' | 'custom' | 'pending' | 'approved'
+  >('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [newTermOriginal, setNewTermOriginal] = useState<string>('');
   const [newTermNormalized, setNewTermNormalized] = useState<string>('');
@@ -54,22 +63,81 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
   const [aiBatchConfirmOpen, setAiBatchConfirmOpen] = useState<boolean>(false);
   const [statusNotification, setStatusNotification] = useState<string | null>(null);
 
-  // Filtered expressions
-  const filteredExpressions = expressions.filter((expr) => {
-    // Search
-    const matchesSearch =
-      expr.original.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      expr.normalized.toLowerCase().includes(searchQuery.toLowerCase());
-    if (!matchesSearch) return false;
+  // Inline editing state
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingNormalizedText, setEditingNormalizedText] = useState<string>('');
 
-    // Filter
-    if (activeFilter === 'dictionary') return expr.source === 'dictionary';
-    if (activeFilter === 'statistical') return expr.source === 'statistical';
-    if (activeFilter === 'custom') return expr.isUserAdded;
-    if (activeFilter === 'pending') return expr.status === 'pending';
-    if (activeFilter === 'approved') return expr.status === 'approved';
-    return true;
+  // Extract statistical candidates from current documents
+  const [isScanningCandidates, setIsScanningCandidates] = useState<boolean>(false);
+  const [allStatisticalCandidates, setAllStatisticalCandidates] = useState<LexicalExpression[]>(() => {
+    return extractStatisticalCandidates(documents, expressions);
   });
+
+  const refreshCandidates = () => {
+    setIsScanningCandidates(true);
+    setTimeout(() => {
+      const fresh = extractStatisticalCandidates(documents, expressions);
+      setAllStatisticalCandidates(fresh);
+      setIsScanningCandidates(false);
+      setStatusNotification(`Análise de n-gramas concluída: ${fresh.length} expressões candidatas identificadas no corpus.`);
+      setTimeout(() => setStatusNotification(null), 5000);
+    }, 150);
+  };
+
+  // Set of comparison keys already registered in the central dictionary
+  const registeredKeySet = useMemo(() => {
+    const set = new Set<string>();
+    for (const expr of expressions) {
+      if (expr.original) {
+        set.add(normalizeExpressionKey(expr.original));
+        set.add(normalizeExpressionKey(expr.original.replace(/[\-_]/g, ' ')));
+      }
+      if (expr.normalized) {
+        set.add(normalizeExpressionKey(expr.normalized));
+        set.add(normalizeExpressionKey(expr.normalized.replace(/[\-_]/g, ' ')));
+      }
+    }
+    return set;
+  }, [expressions]);
+
+  // Candidate terms that have NOT yet been added to the dictionary
+  const eligibleCandidates = useMemo(() => {
+    return allStatisticalCandidates.filter((cand) => {
+      const key = normalizeExpressionKey(cand.original);
+      const normKey = normalizeExpressionKey(cand.normalized);
+      return !registeredKeySet.has(key) && !registeredKeySet.has(normKey);
+    });
+  }, [allStatisticalCandidates, registeredKeySet]);
+
+  // Filtered expressions for table
+  const filteredExpressions = useMemo(() => {
+    if (activeFilter === 'candidates') {
+      return eligibleCandidates.filter((expr) => {
+        if (!searchQuery) return true;
+        const q = searchQuery.toLowerCase();
+        return (
+          expr.original.toLowerCase().includes(q) ||
+          expr.normalized.toLowerCase().includes(q)
+        );
+      });
+    }
+
+    return expressions.filter((expr) => {
+      // Search
+      const matchesSearch =
+        expr.original.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        expr.normalized.toLowerCase().includes(searchQuery.toLowerCase());
+      if (!matchesSearch) return false;
+
+      // Filter
+      if (activeFilter === 'dictionary') return expr.source === 'dictionary';
+      if (activeFilter === 'statistical') return expr.source === 'statistical';
+      if (activeFilter === 'custom') return expr.isUserAdded;
+      if (activeFilter === 'pending') return expr.status === 'pending';
+      if (activeFilter === 'approved') return expr.status === 'approved';
+      return true;
+    });
+  }, [expressions, eligibleCandidates, activeFilter, searchQuery]);
 
   // Candidate ambiguous expressions for AI
   const ambiguousPending = expressions.filter(
@@ -79,20 +147,109 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
   const handleApprove = (id: string) => {
     const updated = expressions.map((e) => (e.id === id ? { ...e, status: 'approved' as const } : e));
     onUpdateExpressions(updated);
+    persistExpressions(updated).catch(() => {});
   };
 
   const handleReject = (id: string) => {
     const updated = expressions.map((e) => (e.id === id ? { ...e, status: 'rejected' as const } : e));
     onUpdateExpressions(updated);
+    persistExpressions(updated).catch(() => {});
   };
 
-  const handleAddCustomTerm = () => {
+  const handleResetToPending = (id: string) => {
+    const updated = expressions.map((e) => (e.id === id ? { ...e, status: 'pending' as const } : e));
+    onUpdateExpressions(updated);
+    persistExpressions(updated).catch(() => {});
+  };
+
+  const handleDelete = (id: string) => {
+    const updated = expressions.filter((e) => e.id !== id);
+    onUpdateExpressions(updated);
+    persistExpressions(updated).catch(() => {});
+    setStatusNotification('Expressão removida do dicionário.');
+    setTimeout(() => setStatusNotification(null), 4000);
+  };
+
+  const handleStartEdit = (expr: LexicalExpression) => {
+    setEditingId(expr.id);
+    setEditingNormalizedText(expr.normalized);
+  };
+
+  const handleSaveEdit = (id: string) => {
+    if (!editingNormalizedText.trim()) return;
+    const cleanNorm = editingNormalizedText.trim().replace(/\s+/g, '_');
+    const updated = expressions.map((e) => (e.id === id ? { ...e, normalized: cleanNorm } : e));
+    onUpdateExpressions(updated);
+    persistExpressions(updated).catch(() => {});
+    setEditingId(null);
+    setEditingNormalizedText('');
+    setStatusNotification('Forma unificada atualizada com sucesso.');
+    setTimeout(() => setStatusNotification(null), 4000);
+  };
+
+  const handleCancelEdit = () => {
+    setEditingId(null);
+    setEditingNormalizedText('');
+  };
+
+  /**
+   * Bulk action: Adds all candidate terms to central state and IndexedDB with 'pending' status
+   */
+  const handleBulkAddAllTerms = async () => {
+    if (eligibleCandidates.length === 0) return;
+
+    // Run robust bulk addition with duplicate checking and preserved decisions
+    const result = addAllCandidateTerms(allStatisticalCandidates, expressions);
+
+    // Save in central state
+    onUpdateExpressions(result.updatedExpressions);
+
+    // Persist to IndexedDB
+    try {
+      await persistExpressions(result.updatedExpressions);
+    } catch (e) {
+      console.warn('Erro ao persistir expressões no IndexedDB:', e);
+    }
+
+    // Notify researcher with exact added and ignored counts
+    setStatusNotification(
+      `Sucesso: ${result.addedCount} expressão(ões) candidata(s) adicionada(s) ao dicionário de revisão com status pendente. ${
+        result.ignoredCount > 0 ? `(${result.ignoredCount} termo(s) já existente(s) foram preservados).` : ''
+      }`
+    );
+    setTimeout(() => setStatusNotification(null), 7000);
+  };
+
+  /**
+   * Adds an individual candidate term to the review dictionary
+   */
+  const handleAddSingleCandidate = async (cand: LexicalExpression) => {
+    const result = addAllCandidateTerms([cand], expressions);
+    if (result.addedCount > 0) {
+      onUpdateExpressions(result.updatedExpressions);
+      try {
+        await persistExpressions(result.updatedExpressions);
+      } catch (e) {}
+      setStatusNotification(`Expressão "${cand.original}" cadastrada para revisão.`);
+      setTimeout(() => setStatusNotification(null), 4000);
+    }
+  };
+
+  const handleAddCustomTerm = async () => {
     if (!newTermOriginal.trim()) return;
-    const norm = newTermNormalized.trim() || newTermOriginal.trim().toLowerCase().replace(/\s+/g, '_');
+    const orig = newTermOriginal.trim();
+    const norm = newTermNormalized.trim() || orig.toLowerCase().replace(/\s+/g, '_');
+
+    // Duplicate check
+    const origKey = normalizeExpressionKey(orig);
+    if (expressions.some((e) => normalizeExpressionKey(e.original) === origKey)) {
+      alert(`O termo "${orig}" já está cadastrado no dicionário.`);
+      return;
+    }
 
     const newExpr: LexicalExpression = {
       id: `custom_${Date.now()}`,
-      original: newTermOriginal.trim(),
+      original: orig,
       normalized: norm,
       source: 'manual',
       frequency: 1,
@@ -105,9 +262,15 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
       justification: 'Cadastrado manualmente pelo pesquisador.',
     };
 
-    onUpdateExpressions([newExpr, ...expressions]);
+    const updated = [newExpr, ...expressions];
+    onUpdateExpressions(updated);
+    try {
+      await persistExpressions(updated);
+    } catch (e) {}
     setNewTermOriginal('');
     setNewTermNormalized('');
+    setStatusNotification(`Termo "${orig}" adicionado com sucesso.`);
+    setTimeout(() => setStatusNotification(null), 4000);
   };
 
   const handleApplyAllApprovedToCorpus = () => {
@@ -256,6 +419,80 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
         </div>
       </div>
 
+      {/* METHOD B — Statistical Detection Section & "Adicionar todos os termos" Button */}
+      <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-xs space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-3 border-b border-slate-100">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                Método B — Expressões Identificadas pelo Mecanismo Estatístico
+              </span>
+              <span className="px-2 py-0.5 text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 rounded">
+                N-gramas (2 a 5 palavras)
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-slate-500">
+              O motor estatístico analisa coocorrências e associação NPMI em todo o corpus ({documents.length} documento{documents.length > 1 ? 's' : ''}). Termos adicionados em lote recebem status pendente para revisão metodológica.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={refreshCandidates}
+              disabled={isScanningCandidates}
+              className="px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md transition-colors cursor-pointer shadow-xs flex items-center gap-1.5"
+              title="Reescanear documentos para identificar novos candidatos"
+            >
+              <RotateCcw className={`w-3.5 h-3.5 ${isScanningCandidates ? 'animate-spin' : ''}`} />
+              Reanalisar Corpus
+            </button>
+
+            {/* BOTÃO PRINCIPAL — ADICIONAR TODOS OS TERMOS */}
+            <button
+              onClick={handleBulkAddAllTerms}
+              disabled={eligibleCandidates.length === 0}
+              className="px-4 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-md transition-colors cursor-pointer shadow-xs flex items-center gap-2"
+              title={
+                eligibleCandidates.length === 0
+                  ? 'Todos os termos candidatos elegíveis já foram adicionados ao dicionário'
+                  : `Adicionar todas as ${eligibleCandidates.length} expressões candidatas ao dicionário de revisão`
+              }
+            >
+              <ListPlus className="w-4 h-4" />
+              Adicionar todos os termos ({eligibleCandidates.length})
+            </button>
+          </div>
+        </div>
+
+        {/* Statistical Summary Metrics */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+          <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+            <div className="text-slate-500">Candidatos no Corpus</div>
+            <div className="text-base font-bold text-slate-900 font-mono mt-0.5">
+              {allStatisticalCandidates.length}
+            </div>
+          </div>
+          <div className="p-3 bg-blue-50/60 rounded-lg border border-blue-100">
+            <div className="text-blue-700 font-medium">Disponíveis para Adição</div>
+            <div className="text-base font-bold text-blue-700 font-mono mt-0.5">
+              {eligibleCandidates.length}
+            </div>
+          </div>
+          <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+            <div className="text-slate-500">Cadastrados no Dicionário</div>
+            <div className="text-base font-bold text-emerald-700 font-mono mt-0.5">
+              {expressions.filter((e) => e.source === 'statistical').length}
+            </div>
+          </div>
+          <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+            <div className="text-slate-500">Expressões Aprovadas</div>
+            <div className="text-base font-bold text-purple-700 font-mono mt-0.5">
+              {expressions.filter((e) => e.status === 'approved').length}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Add Custom Expression Form (Method C) */}
       <div className="bg-white p-4 rounded-lg border border-slate-200 space-y-3">
         <div className="text-xs font-semibold text-slate-900 uppercase tracking-wider">
@@ -312,7 +549,17 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
               activeFilter === 'statistical' ? 'bg-white text-slate-900 shadow-xs font-semibold' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            N-gramas Estatísticos
+            N-gramas Estatísticos ({expressions.filter((e) => e.source === 'statistical').length})
+          </button>
+          <button
+            onClick={() => setActiveFilter('candidates')}
+            className={`px-3 py-1.5 rounded-md transition-colors cursor-pointer ${
+              activeFilter === 'candidates'
+                ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                : 'text-blue-700 hover:text-blue-900'
+            }`}
+          >
+            Candidatos Não Cadastrados ({eligibleCandidates.length})
           </button>
           <button
             onClick={() => setActiveFilter('pending')}
@@ -320,7 +567,7 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
               activeFilter === 'pending' ? 'bg-white text-slate-900 shadow-xs font-semibold' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Pendentes de Revisão
+            Pendentes ({expressions.filter((e) => e.status === 'pending').length})
           </button>
           <button
             onClick={() => setActiveFilter('approved')}
@@ -328,20 +575,33 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
               activeFilter === 'approved' ? 'bg-white text-slate-900 shadow-xs font-semibold' : 'text-slate-600 hover:text-slate-900'
             }`}
           >
-            Aprovadas
+            Aprovadas ({expressions.filter((e) => e.status === 'approved').length})
           </button>
         </div>
 
-        {/* Search */}
-        <div className="relative w-full sm:w-64">
-          <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
-          <input
-            type="text"
-            placeholder="Filtrar expressões..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full text-xs pl-9 pr-3 py-2 bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-xs"
-          />
+        {/* Search & Bulk action when in statistical view */}
+        <div className="flex items-center gap-2">
+          {(activeFilter === 'statistical' || activeFilter === 'candidates') && eligibleCandidates.length > 0 && (
+            <button
+              onClick={handleBulkAddAllTerms}
+              className="px-3 py-2 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors cursor-pointer shadow-xs flex items-center gap-1.5 shrink-0"
+              title="Adicionar todos os termos candidatos ao dicionário de revisão"
+            >
+              <ListPlus className="w-3.5 h-3.5" />
+              Adicionar todos os termos ({eligibleCandidates.length})
+            </button>
+          )}
+
+          <div className="relative w-full sm:w-64">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+            <input
+              type="text"
+              placeholder="Filtrar expressões..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full text-xs pl-9 pr-3 py-2 bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-xs"
+            />
+          </div>
         </div>
       </div>
 
@@ -365,13 +625,18 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
               {filteredExpressions.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="px-4 py-8 text-center text-slate-400">
-                    Nenhuma expressão encontrada para o filtro selecionado.
+                    {activeFilter === 'candidates'
+                      ? 'Nenhuma nova expressão candidata pendente de adição. Todos os termos já foram cadastrados.'
+                      : 'Nenhuma expressão encontrada para o filtro selecionado.'}
                   </td>
                 </tr>
               ) : (
                 filteredExpressions.map((expr) => {
                   const isApproved = expr.status === 'approved';
                   const isRejected = expr.status === 'rejected';
+                  const isPending = expr.status === 'pending';
+                  const isCandidateRow = activeFilter === 'candidates';
+                  const isEditing = editingId === expr.id;
 
                   return (
                     <tr key={expr.id} className="hover:bg-slate-50/70 transition-colors">
@@ -379,16 +644,57 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
                         {expr.original}
                       </td>
                       <td className="px-4 py-3 font-mono text-blue-700 font-medium">
-                        {expr.normalized}
+                        {isEditing ? (
+                          <div className="flex items-center gap-1.5">
+                            <input
+                              type="text"
+                              value={editingNormalizedText}
+                              onChange={(e) => setEditingNormalizedText(e.target.value)}
+                              className="px-2 py-1 text-xs border border-blue-400 rounded bg-white font-mono focus:outline-none focus:ring-1 focus:ring-blue-500 w-36"
+                              autoFocus
+                            />
+                            <button
+                              onClick={() => handleSaveEdit(expr.id)}
+                              className="p-1 text-emerald-600 hover:bg-emerald-50 rounded cursor-pointer"
+                              title="Salvar alteração"
+                            >
+                              <Save className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={handleCancelEdit}
+                              className="p-1 text-slate-400 hover:bg-slate-100 rounded cursor-pointer"
+                              title="Cancelar edição"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1.5 group">
+                            <span>{expr.normalized}</span>
+                            {!isCandidateRow && (
+                              <button
+                                onClick={() => handleStartEdit(expr)}
+                                className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-400 hover:text-slate-700 rounded transition-opacity cursor-pointer"
+                                title="Editar forma unificada"
+                              >
+                                <Edit2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-slate-500">
-                        {expr.source === 'dictionary'
-                          ? 'Dicionário'
-                          : expr.source === 'statistical'
-                          ? 'N-grama Local'
-                          : expr.source === 'gemini'
-                          ? 'Assistida por IA'
-                          : 'Manual'}
+                        {isCandidateRow ? (
+                          <span className="text-blue-600 font-medium">Candidato N-grama</span>
+                        ) : expr.source === 'dictionary' ? (
+                          'Dicionário'
+                        ) : expr.source === 'statistical' ? (
+                          'N-grama Local'
+                        ) : expr.source === 'gemini' ? (
+                          'Assistida por IA'
+                        ) : (
+                          'Manual'
+                        )}
                       </td>
                       <td className="px-4 py-3 text-right font-mono tabular-nums text-slate-700">
                         {expr.frequency} em {expr.docCount} doc{expr.docCount > 1 ? 's' : ''}
@@ -407,43 +713,76 @@ export const DictionaryView: React.FC<DictionaryViewProps> = ({
                         </div>
                       </td>
                       <td className="px-4 py-3 text-center">
-                        <span
-                          className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${
-                            isApproved
-                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                              : isRejected
-                              ? 'bg-red-50 text-red-700 border border-red-200'
-                              : 'bg-amber-50 text-amber-700 border border-amber-200'
-                          }`}
-                        >
-                          {isApproved ? 'Aprovada' : isRejected ? 'Rejeitada' : 'Pendente'}
-                        </span>
+                        {isCandidateRow ? (
+                          <span className="inline-flex px-2 py-0.5 rounded text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200">
+                            Disponível
+                          </span>
+                        ) : (
+                          <span
+                            className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold ${
+                              isApproved
+                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                : isRejected
+                                ? 'bg-red-50 text-red-700 border border-red-200'
+                                : 'bg-amber-50 text-amber-700 border border-amber-200'
+                            }`}
+                          >
+                            {isApproved ? 'Aprovada' : isRejected ? 'Rejeitada' : 'Pendente'}
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-right">
-                        <div className="flex items-center justify-end gap-1.5">
+                        {isCandidateRow ? (
                           <button
-                            onClick={() => handleApprove(expr.id)}
-                            className={`p-1.5 rounded transition-colors cursor-pointer ${
-                              isApproved
-                                ? 'bg-emerald-100 text-emerald-800'
-                                : 'text-slate-400 hover:text-emerald-600 hover:bg-emerald-50'
-                            }`}
-                            title="Aprovar substituição"
+                            onClick={() => handleAddSingleCandidate(expr)}
+                            className="px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded transition-colors cursor-pointer flex items-center gap-1 ml-auto"
+                            title="Adicionar ao dicionário para revisão"
                           >
-                            <Check className="w-3.5 h-3.5" />
+                            <Plus className="w-3 h-3" />
+                            Adicionar
                           </button>
-                          <button
-                            onClick={() => handleReject(expr.id)}
-                            className={`p-1.5 rounded transition-colors cursor-pointer ${
-                              isRejected
-                                ? 'bg-red-100 text-red-800'
-                                : 'text-slate-400 hover:text-red-600 hover:bg-red-50'
-                            }`}
-                            title="Rejeitar substituição"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
+                        ) : (
+                          <div className="flex items-center justify-end gap-1">
+                            <button
+                              onClick={() => handleApprove(expr.id)}
+                              className={`p-1.5 rounded transition-colors cursor-pointer ${
+                                isApproved
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : 'text-slate-400 hover:text-emerald-600 hover:bg-emerald-50'
+                              }`}
+                              title="Aprovar substituição"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              onClick={() => handleReject(expr.id)}
+                              className={`p-1.5 rounded transition-colors cursor-pointer ${
+                                isRejected
+                                  ? 'bg-red-100 text-red-800'
+                                  : 'text-slate-400 hover:text-red-600 hover:bg-red-50'
+                              }`}
+                              title="Rejeitar substituição"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                            {!isPending && (
+                              <button
+                                onClick={() => handleResetToPending(expr.id)}
+                                className="p-1.5 text-slate-400 hover:text-amber-600 hover:bg-amber-50 rounded transition-colors cursor-pointer"
+                                title="Redefinir para pendente"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleDelete(expr.id)}
+                              className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors cursor-pointer"
+                              title="Excluir do dicionário"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   );

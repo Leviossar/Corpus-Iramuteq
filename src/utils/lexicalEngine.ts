@@ -28,15 +28,100 @@ export function tokenizeWords(text: string): string[] {
 }
 
 /**
+ * Normalizes an expression key for robust comparison and duplicate detection:
+ * - Canonical Unicode normalization (NFC)
+ * - Lowercase transformation
+ * - Collapsing multiple spaces and whitespace
+ * - Treats spaces, hyphens, and underscores as equivalent word separators
+ * - Strictly preserves diacritics / accents (e.g., "avaliação" and "avaliacao" remain distinct)
+ */
+export function normalizeExpressionKey(term: string): string {
+  if (!term) return '';
+  return term
+    .normalize('NFC')
+    .toLowerCase()
+    .trim()
+    .replace(/[\s\-_]+/g, ' ');
+}
+
+export interface BulkAddResult {
+  updatedExpressions: LexicalExpression[];
+  addedCount: number;
+  ignoredCount: number;
+  addedItems: LexicalExpression[];
+}
+
+/**
+ * Bulk adds candidate terms to the review dictionary:
+ * 1. Considers the complete set of candidates (not just visible page)
+ * 2. Compares against all registered expressions using normalized comparison keys
+ * 3. Prevents duplicates
+ * 4. Preserves human decisions already registered (approved, rejected, pending)
+ * 5. Adds only new terms with status 'pending'
+ * 6. Returns updated list with accurate added and ignored counts
+ */
+export function addAllCandidateTerms(
+  candidates: LexicalExpression[],
+  existingExpressions: LexicalExpression[]
+): BulkAddResult {
+  const existingKeySet = new Set<string>();
+
+  for (const expr of existingExpressions) {
+    if (expr.original) existingKeySet.add(normalizeExpressionKey(expr.original));
+    if (expr.normalized) existingKeySet.add(normalizeExpressionKey(expr.normalized));
+  }
+
+  const addedItems: LexicalExpression[] = [];
+  let ignoredCount = 0;
+
+  for (const cand of candidates) {
+    const key = normalizeExpressionKey(cand.original);
+    const normKey = normalizeExpressionKey(cand.normalized);
+
+    // If candidate or its normalized equivalent already exists, preserve existing decision & ignore
+    if (existingKeySet.has(key) || existingKeySet.has(normKey)) {
+      ignoredCount++;
+      continue;
+    }
+
+    // Register so later candidates in the same batch don't duplicate
+    existingKeySet.add(key);
+    existingKeySet.add(normKey);
+
+    const newExpr: LexicalExpression = {
+      ...cand,
+      id: cand.id && cand.id.startsWith('stat_')
+        ? cand.id
+        : `cand_${Date.now()}_${Math.random().toString(36).substr(2, 7)}`,
+      status: 'pending', // Rule 3.4: Methodological requirement: added in batch receive 'pending'
+      appliedCount: 0,
+      justification:
+        cand.justification ||
+        `Expressão candidata estatística (N-grama com ${cand.frequency} ocorrência(s)) adicionada para revisão.`,
+    };
+
+    addedItems.push(newExpr);
+  }
+
+  return {
+    updatedExpressions: [...existingExpressions, ...addedItems],
+    addedCount: addedItems.length,
+    ignoredCount,
+    addedItems,
+  };
+}
+
+/**
  * Method B: Extract statistical n-grams (2 to 5 words) across all documents with NPMI association calculation
  */
 export function extractStatisticalCandidates(
   documents: DocumentItem[],
-  existingExpressions: LexicalExpression[] = []
+  existingExpressions: LexicalExpression[] = [],
+  maxCandidates: number = 250
 ): LexicalExpression[] {
   const existingMap = new Map<string, LexicalExpression>();
   for (const expr of existingExpressions) {
-    existingMap.set(expr.original.toLowerCase(), expr);
+    existingMap.set(normalizeExpressionKey(expr.original), expr);
   }
 
   const unigramCounts = new Map<string, number>();
@@ -194,7 +279,7 @@ export function extractStatisticalCandidates(
   // Sort by frequency descending
   results.sort((a, b) => b.frequency - a.frequency);
 
-  return results.slice(0, 100);
+  return results.slice(0, maxCandidates);
 }
 
 /**

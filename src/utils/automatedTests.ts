@@ -9,6 +9,8 @@ import {
   applyApprovedCompoundWords,
   revertCompoundWord,
   tokenizeWords,
+  addAllCandidateTerms,
+  normalizeExpressionKey,
 } from './lexicalEngine';
 import { FallbackManager } from '../services/geminiService';
 import { sanitizeIramuteqVar, buildIramuteqCommandLine, validateCorpus, generateIramuteqTxt } from './iramuteqValidator';
@@ -201,6 +203,73 @@ export function runAllAutomatedTests(): TestResultItem[] {
     name: 'Isolamento de limites de palavra (evitar substituição em "congestão")',
     passed: subWordUpdated.includes('congestão de processos') && !subWordUpdated.includes('congestão_de_processos'),
     details: `Regex Unicode lookaround respeitou a palavra "congestão".`,
+  });
+
+  // Test 2.4: Normalização de chave com preservação de acentos e equivalência de separadores
+  const key1 = normalizeExpressionKey('Educação  Empreendedora');
+  const key2 = normalizeExpressionKey('educação_empreendedora');
+  const key3 = normalizeExpressionKey('educacao empreendedora');
+  const isEquivalent = key1 === key2;
+  const preservesDiacritics = key1 !== key3;
+  results.push({
+    id: 'comp_4',
+    category: 'Palavras Compostas',
+    name: 'Normalização robusta de chaves (NFC, caixa e preservação estrita de acentos)',
+    passed: isEquivalent && preservesDiacritics,
+    details: `Chave 1: "${key1}" === Chave 2: "${key2}" | Diacríticos mantidos distintos de "${key3}"`,
+  });
+
+  // Test 2.5: Adicionar todos os termos em lote com status pendente e controle de duplicatas
+  const mockCandidates: LexicalExpression[] = [
+    {
+      id: 'c1',
+      original: 'gestão de processos', // Já cadastrado em compoundExpressions
+      normalized: 'gestão_de_processos',
+      source: 'statistical',
+      frequency: 10,
+      docCount: 3,
+      contexts: [],
+      status: 'pending',
+      ambiguityScore: 0.2,
+      appliedCount: 0,
+    },
+    {
+      id: 'c2',
+      original: 'Educação Empreendedora', // Novo termo com maiúsculas
+      normalized: 'educação_empreendedora',
+      source: 'statistical',
+      frequency: 5,
+      docCount: 2,
+      contexts: [],
+      status: 'approved', // Simulação: deve ser forçado a 'pending' pela regra metodológica
+      ambiguityScore: 0.1,
+      appliedCount: 0,
+    },
+    {
+      id: 'c3',
+      original: 'tomada de decisão', // Novo termo
+      normalized: 'tomada_de_decisão',
+      source: 'statistical',
+      frequency: 7,
+      docCount: 2,
+      contexts: [],
+      status: 'pending',
+      ambiguityScore: 0.3,
+      appliedCount: 0,
+    },
+  ];
+
+  const bulkAddResult = addAllCandidateTerms(mockCandidates, compoundExpressions);
+  const correctCount = bulkAddResult.addedCount === 2 && bulkAddResult.ignoredCount === 1;
+  const allNewPending = bulkAddResult.addedItems.every((item) => item.status === 'pending');
+  const existingPreserved = bulkAddResult.updatedExpressions.find((e) => e.id === 'e1')?.status === 'approved';
+
+  results.push({
+    id: 'comp_5',
+    category: 'Palavras Compostas',
+    name: 'Adição em lote "Adicionar todos os termos" com status pendente e prevenção de duplicatas',
+    passed: correctCount && allNewPending && existingPreserved,
+    details: `Adicionados: ${bulkAddResult.addedCount}, Ignorados (duplicados): ${bulkAddResult.ignoredCount}, Status pendente assegurado em todos os novos termos.`,
   });
 
   // ==========================================
